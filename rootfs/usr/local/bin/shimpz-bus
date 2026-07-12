@@ -1,0 +1,363 @@
+#!/opt/venv/bin/python
+"""shimpz-bus — ops + scaffolding for the streaming bus (Redpanda, Kafka API).
+
+  shimpz-bus health                          is the cluster reachable?
+  shimpz-bus topics                          list topics
+  shimpz-bus create <topic> [-p N]           create a topic (N partitions, default 1)
+  shimpz-bus produce <topic> <json> [key]    publish one message
+  shimpz-bus tail <topic> [-n N]             print up to N messages from the start (debug)
+  shimpz-bus new-worker <name> <topic>       scaffold a SUPERVISED consumer worker (retry + DLQ) project
+  shimpz-bus provision <project>             create/rotate that project's own SASL user + ACLs, scoped
+                                           to <project>.* topics/groups only; prints its SHIMPZ_BUS_SASL_*
+  shimpz-bus grant <consumer> <topic>        let <consumer> CONSUME a FOREIGN topic (another project's)
+                                           — READ-only; the async twin of `shimpz-app --calls`
+                                           lines to paste into the project's .env
+
+Brokers from $SHIMPZ_BUS_BROKERS (default redpanda:9092). The worker pattern is the standard for
+event-driven integration, queues, retries and continuous loops cron can't do — see the
+`redpanda-queue-integration` playbook. Workers run supervised via `shimpz-app`, NEVER cron.
+
+Cluster auth (SASL/SCRAM, SECURITY_ENGINEERING_PLAN.md item 2): health/topics/create/produce/tail/
+provision run as the cluster SUPERUSER — but `shimpz-brain` no longer holds that credential itself. They go
+through bus-driver's restricted, audited HTTP API (this CLI's only client-side change); the
+SAME operations, same trust level as before, just relocated. A project's OWN worker never gets
+superuser creds — it gets a least-privilege proj_<name> user from `provision`, scoped by ACL prefix
+so it can only ever touch its own <name>.* topics/groups. `new-worker`/`services`/`discover` are
+UNCHANGED — they never touched the superuser credential; they already run as a project's own
+SHIMPZ_BUS_SASL_* identity via the shimpzbus library.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import textwrap
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, "/opt/shimpz-lib/shimpzbus/src")
+import shimpzbus  # the standard lib (registry/discovery live here)
+
+_BUSDRIVER_URL = os.environ.get("SHIMPZ_BUSDRIVER_URL", "http://bus-driver:7073")
+_BUSDRIVER_TOKEN_FILE = os.environ.get("SHIMPZ_BUSDRIVER_TOKEN_FILE", "/run/shimpz-busdriver/token")
+
+
+class BusDriverError(Exception):
+    """A bus-driver call failed — the sidecar's response IS the error message."""
+
+
+def _busdriver_token() -> str:
+    try:
+        return Path(_BUSDRIVER_TOKEN_FILE).read_text().strip()
+    except OSError as exc:
+        raise BusDriverError(f"cannot read bus-driver token ({_BUSDRIVER_TOKEN_FILE}): {exc}") from exc
+
+
+def _busdriver(method: str, path: str, body: dict | None = None) -> dict:
+    """Thin HTTP client for bus-driver.
+
+    Same contract as cfdriver.sh/pgdriver.sh's own client functions (bash), just in Python since
+    shimpz-bus is a Python CLI.
+    """
+    token = _busdriver_token()
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(  # noqa: S310 — SHIMPZ_BUSDRIVER_URL is fixed infra config, never user-controlled
+        f"{_BUSDRIVER_URL}{path}",
+        data=data,
+        method=method,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 — see above
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read()).get("error", exc.reason)
+        # PEP 758 (Python 3.14, this repo's pinned version): a comma-separated except list needs no
+        # parens — equivalent to `except (json.JSONDecodeError, ValueError):`. Verified: `ast.parse`
+        # and a real run both succeed; `ruff format` (this repo's canonical formatter) itself
+        # rewrites a parenthesized tuple into exactly this shape, so this is the STANDARD style
+        # here, not a Python-2 leftover.
+        except json.JSONDecodeError, ValueError:
+            detail = exc.reason
+        raise BusDriverError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise BusDriverError(f"{method} {path} -> unreachable: {exc.reason}") from exc
+
+
+def _alive(http):
+    """True iff a registered `host:port` endpoint is actually listening.
+
+    The registry is a set of promises; `services`/`discover` must never present a dead entry as
+    reusable (a ghost registration once advertised a never-deployed service). None (bus-only
+    worker) has no endpoint to probe → not judged here.
+
+    A containerized app (`app_<name>:<port>`) lives on its OWN isolated network the brain cannot
+    reach BY DESIGN (R101) — a direct TCP probe would mark every live app DEAD. Those are judged
+    through shimpz-driver's health endpoint (it probes from inside the app's own context);
+    anything else (legacy/brain-local endpoint) keeps the direct 0.5s TCP probe.
+    """
+    import socket
+
+    host, _, port = str(http).rpartition(":")
+    if host.startswith("app_"):
+        try:
+            token = Path(os.environ.get("SHIMPZ_DRIVER_TOKEN_FILE", "/run/shimpz-driver/token")).read_text().strip()
+            url = os.environ.get("SHIMPZ_DRIVER_URL", "http://shimpz-driver:7070")
+            req = urllib.request.Request(  # noqa: S310 — fixed internal driver URL, never user input
+                f"{url}/v1/apps/{host.removeprefix('app_')}/health",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+                return bool(json.loads(resp.read()).get("healthy"))
+        except OSError, ValueError, urllib.error.URLError:
+            return False
+    try:
+        with socket.create_connection((host or "127.0.0.1", int(port)), timeout=0.5):
+            return True
+    except OSError, ValueError:  # PEP 758, same note as _busdriver above
+        return False
+
+
+def _dead_note(s):
+    """A loud suffix for a registered-but-not-listening service (empty when fine)."""
+    if not s.get("http") or _alive(s["http"]):
+        return ""
+    return "  ⚠ DEAD — registered but nothing listens there; deploy it (shimpz-app) or deregister, do NOT build on it"
+
+
+def cmd_health(_a):
+    try:
+        result = _busdriver("GET", "/v1/bus/health")
+    except BusDriverError as exc:
+        sys.exit(f"health check FAILED: {exc}")
+    print(f"OK — {result['brokers']} broker(s), {result['topics']} topic(s) @ {result['bootstrap']}")
+
+
+def cmd_topics(_a):
+    try:
+        result = _busdriver("GET", "/v1/bus/topics")
+    except BusDriverError as exc:
+        sys.exit(f"topics FAILED: {exc}")
+    for t in result["topics"]:
+        print(t)
+
+
+def cmd_create(a):
+    try:
+        result = _busdriver("POST", "/v1/bus/topics/create", {"topic": a.topic, "partitions": a.partitions})
+    except BusDriverError as exc:
+        # A real create failure (auth, unreachable, invalid config) must EXIT non-zero — not
+        # print the error and exit 0, which read as success to any caller/script.
+        sys.exit(f"create {a.topic} FAILED: {exc}")
+    print(("created:" if result["created"] else "exists:"), result["topic"])
+
+
+def cmd_produce(a):
+    try:
+        payload = json.loads(a.json)
+    except json.JSONDecodeError:
+        sys.exit("payload must be JSON")
+    if not isinstance(payload, dict):
+        sys.exit("payload must be a JSON object")
+    try:
+        _busdriver("POST", "/v1/bus/produce", {"topic": a.topic, "payload": payload, "key": a.key})
+    except BusDriverError as exc:
+        sys.exit(f"produce to {a.topic} FAILED: {exc}")
+    print("published to", a.topic)
+
+
+def cmd_tail(a):
+    try:
+        result = _busdriver("GET", f"/v1/bus/tail?topic={a.topic}&n={a.n}")
+    except BusDriverError as exc:
+        sys.exit(f"tail {a.topic} FAILED: {exc}")
+    for m in result["messages"]:
+        print("{} | {}".format(m["key"] or "-", m["value"]))
+    print(f"({result['count']} message(s))")
+
+
+WORKER_PY = '''\
+import shimpzbus  # vendored at vendor/shimpzbus and declared in pyproject — run via `uv run` so the
+               # project venv (which works inside the app's own container too) resolves it
+
+def handle(event):
+    """Process one event from '%(topic)s'. Integrate with another system here — emit a follow-up
+    event (shimpzbus.publish), or call a discovered service (shimpzbus.call("name","/route","POST",{...})).
+    RAISE to trigger a retry; after the retries the message goes to '%(topic)s.dlq'."""
+    print("processing:", event)
+
+if __name__ == "__main__":
+    # register_self=False: this worker runs in its OWN app container where the registry is mounted
+    # READ-ONLY — registration is the deploy's job (shimpz-app runs register.py on the brain). Keep
+    # register.py's publishes/consumes in sync with what this handler actually does.
+    shimpzbus.run_worker("%(topic)s", handle, name="%(name)s",
+                      description="consumes %(topic)s",
+                      publishes=[],   # e.g. publishes=["%(topic)s.processed"]
+                      register_self=False)
+                      # loop: retry + dead-letter + at-least-once
+'''
+
+REGISTER_PY = '''\
+"""Deploy-time registration — run BY `shimpz-app deploy` ON THE BRAIN, never inside the worker
+(its container mounts the service registry READ-ONLY; only the trusted plane writes manifests)."""
+import sys
+
+import shimpzbus
+
+
+def main(app_name: str, port: str) -> None:  # port unused: a pure consumer has no HTTP surface
+    shimpzbus.register(app_name, "consumes %(topic)s", kind="worker", http=None,
+                    consumes=["%(topic)s"], publishes=[])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])
+'''
+
+PYPROJECT = """\
+[project]
+name = "%(name)s"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["shimpzbus"]
+
+[tool.uv.sources]
+shimpzbus = { path = "vendor/shimpzbus" }
+"""
+
+# The worker deploys as its OWN container mounting only the project read-only at /app — a brain
+# path like /opt/shimpz-lib/shimpzbus can never resolve there, so the source is vendored per-project.
+_SHIMPZBUS_SRC = Path("/opt/shimpz-lib/shimpzbus")
+
+
+def cmd_new_worker(a):
+    root = Path(f"/config/workspace/projects/{a.name}/backend")
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "worker.py").write_text(WORKER_PY % {"topic": a.topic, "name": a.name})
+    (root / "pyproject.toml").write_text(PYPROJECT % {"name": a.name})
+    (root / "register.py").write_text(REGISTER_PY % {"topic": a.topic})
+    if not (root / "vendor" / "shimpzbus").is_dir():
+        shutil.copytree(_SHIMPZBUS_SRC, root / "vendor" / "shimpzbus", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    print(
+        textwrap.dedent(f"""\
+        scaffolded {root}  (consumer of '{a.topic}', retry + dead-letter '{a.topic}.dlq', self-registers)
+        next:
+          cd {root} && uv sync                       # installs the shimpzbus lib + deps
+          shimpz-app deploy --worker {a.name} 3190 -- uv run --project {root} python {root}/worker.py
+        (--worker = no HTTP surface: the deploy smoke checks the process stays RUNNING instead of
+         probing the port. --project makes `uv run` use THIS project's venv from any CWD; the port is
+         unused by a worker — shimpz-app just supervises the loop. NEVER cron.)
+        test:  shimpz-bus produce {a.topic} '{{"hello":"world"}}'   then   shimpz-bus services""")
+    )
+
+
+def cmd_provision(a):
+    try:
+        result = _busdriver("POST", "/v1/bus/provision", {"project": a.project})
+    except BusDriverError as exc:
+        sys.exit(f"provision {a.project} FAILED: {exc}")
+    # display the SANITIZED name the server actually used (strip its "proj_" username prefix),
+    # not the raw CLI arg — same value shimpz-bus used to print before sanitization moved server-side.
+    sanitized = result["username"].removeprefix("proj_")
+    print(f"provisioned bus identity for project {sanitized!r} — paste into its .env:")
+    print(f"SHIMPZ_BUS_SASL_USERNAME={result['username']}")
+    print(f"SHIMPZ_BUS_SASL_PASSWORD={result['password']}")
+    print(f"SHIMPZ_BUS_SASL_MECHANISM={result['mechanism']}")
+    prefix = result["topic_prefix"]
+    print(f"# topics/consumer-groups for this project MUST start with '{prefix}' — anything else is denied")
+
+
+def cmd_grant(a):
+    # Cross-project CONSUME grant (R131): let <consumer>'s proj_ identity READ a FOREIGN topic
+    # (another project's) — the async twin of `shimpz-app --calls`. The consumer keeps its group + DLQ
+    # in its OWN <consumer>.* namespace; this is the ONLY grant it needs. Idempotent.
+    try:
+        result = _busdriver("POST", "/v1/bus/grant", {"consumer": a.consumer, "topic": a.topic})
+    except BusDriverError as exc:
+        sys.exit(f"grant {a.consumer} -> {a.topic} FAILED: {exc}")
+    print(f"granted {result['principal']} {'+'.join(result['operations'])} on topic {result['topic']!r}")
+    print(f"# {a.consumer} can now CONSUME '{a.topic}'; keep its consumer-group + DLQ under its own")
+    print(f"# '{shimpzbus_sanitize(a.consumer)}.' prefix (no further grant needed).")
+
+
+def shimpzbus_sanitize(name):
+    import re as _re
+
+    return _re.sub(r"[^a-z0-9_]+", "_", str(name).lower()).strip("_")
+
+
+def cmd_services(_a):
+    svcs = shimpzbus.services()
+    if not svcs:
+        print("(no services registered yet — they self-announce on startup)")
+        return
+    for s in svcs:
+        print(f"• {s.get('name')!s:<22} [{s.get('kind')}] {s.get('http') or '—'}{_dead_note(s)}")
+        if s.get("description"):
+            print("    {}".format(s["description"]))
+        if s.get("publishes"):
+            print("    publishes: {}".format(", ".join(s["publishes"])))
+        if s.get("consumes"):
+            print("    consumes:  {}".format(", ".join(s["consumes"])))
+
+
+def cmd_discover(a):
+    hits = shimpzbus.discover(a.query)
+    if not hits:
+        print(f"nothing found for '{a.query}' — you can build a new service.")
+        return
+    print("already exist(s) — REUSE instead of duplicating:")
+    for s in hits:
+        print(
+            "• {} [{}] {} — {}{}".format(
+                s.get("name"),
+                s.get("kind"),
+                s.get("http") or "—",
+                s.get("description", ""),
+                _dead_note(s),
+            )
+        )
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="shimpz-bus")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("health").set_defaults(fn=cmd_health)
+    sub.add_parser("topics").set_defaults(fn=cmd_topics)
+    c = sub.add_parser("create")
+    c.add_argument("topic")
+    c.add_argument("-p", "--partitions", type=int, default=1)
+    c.set_defaults(fn=cmd_create)
+    pr = sub.add_parser("produce")
+    pr.add_argument("topic")
+    pr.add_argument("json")
+    pr.add_argument("key", nargs="?")
+    pr.set_defaults(fn=cmd_produce)
+    t = sub.add_parser("tail")
+    t.add_argument("topic")
+    t.add_argument("-n", type=int, default=10)
+    t.set_defaults(fn=cmd_tail)
+    w = sub.add_parser("new-worker")
+    w.add_argument("name")
+    w.add_argument("topic")
+    w.set_defaults(fn=cmd_new_worker)
+    sub.add_parser("services").set_defaults(fn=cmd_services)
+    dd = sub.add_parser("discover")
+    dd.add_argument("query")
+    dd.set_defaults(fn=cmd_discover)
+    pv = sub.add_parser("provision")
+    pv.add_argument("project")
+    pv.set_defaults(fn=cmd_provision)
+    gr = sub.add_parser("grant")
+    gr.add_argument("consumer", help="the CONSUMING project (its proj_<name> identity gets READ)")
+    gr.add_argument("topic", help="the FOREIGN topic to allow it to consume, e.g. salesnator_meta.capi_events")
+    gr.set_defaults(fn=cmd_grant)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,685 @@
+#!/opt/venv/bin/python
+"""shimpz-stdgate — Stop hook: the ECOSYSTEM-STANDARD GATE.
+
+Runs in FRONT of the auto-commit hook (shimpz-project-sync), exactly like the dev-side
+battle-test-gate fronts sync.sh.
+
+At the end of a turn it validates the projects in play this turn: uncommitted changes, OR a HEAD
+that moved since the last gate pass (a manual `git commit` mid-task used to leave the tree clean
+and skip the gate entirely — the one bypass CLAUDE.md itself encouraged via milestone commits). An
+untouched old project (clean tree, same HEAD) is never re-judged — you can't be blocked by code you
+didn't write. It runs the deterministic shimpz-stdcheck over each; if any BLOCK-level violation exists,
+it BLOCKS the stop and tells the agent exactly what to fix, and it does NOT hand off to sync (so
+non-standard code is never committed). When everything is clean it execs shimpz-project-sync (commit +
+best-effort push) and records each project's post-sync HEAD.
+
+Combining gate+sync in ONE hook is deliberate: two separate Stop hooks have no ordering guarantee, so
+sync could commit before the gate blocked. There is no model here — every check is a cheap regex, so
+this is free to run on every turn even with the Sonnet brain.
+
+FAIL-OPEN on any internal error (run sync, allow the stop): a bug in this gate must never wedge Shimpz
+mid-conversation (Juliano may be driving). Worst case it degrades to plain commit with no gate — but
+every degrade is surfaced to stderr AND pushed to Juliano via shimpz-tg at end of turn (R89): stderr
+alone proved invisible in practice — a gate that degrades where nobody looks is no gate.
+
+Ruff config (R89): a project whose own ruff.toml upholds the required families is scanned via normal
+discovery; a project with NO ruff.toml or a WEAKENED one is scanned with the CANONICAL config shipped
+in the image (/usr/local/share/shimpz-std/ruff.toml — the same file shimpz-new scaffolds), and a weakened
+file is its own BLOCK finding. Time budget (R89): scans stop at SHIMPZ_STDGATE_BUDGET seconds (default
+240, below the hook's 300s timeout) — whatever is left unscanned degrades LOUDLY instead of the hook
+being killed mid-scan and the turn ending ungated.
+
+Escape hatches: env SHIMPZ_STDCHECK=0 disables the gate entirely — and notifies Juliano every time (a
+kill-switch the owner can't see is a bypass); replying with STDCHECK_SKIP:<rule-id> waives THAT RULE
+for one turn (for a genuine false positive) — both still run sync. A waiver is rule-scoped on purpose
+(the old bare token was a blanket self-waiver the model controlled) and every use is reported to
+Juliano via shimpz-tg. The auditor recursion no-op (SHIMPZ_SECAUDIT_RUNNING/SHIMPZ_LOGAUDIT_RUNNING/
+SHIMPZ_SKILLAUDIT_RUNNING) is honored ONLY while the live auditor's lockfile backs it (R89) — the bare env
+var was a forgeable full bypass.
+"""
+
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+# /opt/shimpz-lib in-container; <repo>/rootfs/opt/shimpz-lib when the host suite loads this file.
+sys.path.insert(0, str(HERE.parents[2] / "opt" / "shimpz-lib"))
+import shimpzaudit
+import shimpzprompt
+
+SKIP_TOKEN = "STDCHECK_SKIP"
+# A waiver names the rule it waives (STDCHECK_SKIP:raw-psycopg-connect, STDCHECK_SKIP:ruff:S602).
+# The bare token waives NOTHING — a blanket self-waiver the model controls is a gate bypass.
+_SKIP_RE = re.compile(re.escape(SKIP_TOKEN) + r":([A-Za-z0-9._:-]+)")
+
+REASON = (
+    "🧱 ECOSYSTEM-STANDARD GATE — fix before this turn ends (the project doesn't meet the "
+    "non-negotiable stack rules, so it will NOT be committed yet):\n\n{}\n\n"
+    "These are hard violations (a publish-breaker or a secret leak), not style. Fix each one above, "
+    "then end the turn — the gate re-checks automatically. If (and only if) one is a genuine false "
+    "positive, reply with {}:<rule-id> (the [rule] shown on the finding) and one line saying why, to "
+    "waive THAT rule for this turn — Juliano is notified of every waiver."
+).format("%s", SKIP_TOKEN)
+
+
+# Degradations: every place this gate FAILS OPEN (a scan that didn't happen, a linter that didn't
+# run, a budget that ran out) is queued here and pushed to Juliano via shimpz-tg at the end of main().
+# R80 proved a stderr-only degrade is invisible in practice (the dev battle judge fail-opened on every
+# feature turn for ~2 days before anyone saw it) — an owner who can't see the gate degrade has no gate.
+DEGRADES = []
+
+# Projects whose validation did NOT fully happen this turn (stdcheck crashed, ruff couldn't run,
+# budget exhausted). R90: these used to be committed AND baselined by _save_heads — clean tree +
+# matching HEAD next turn meant a project that slipped through on a degraded turn was NEVER
+# re-validated until some unrelated edit touched it. Skipping them from the baseline pulls them
+# back into validation on the very next turn.
+UNVALIDATED = set()
+
+
+def _degrade(msg, project=None):
+    """Record + surface one fail-open degradation (stderr now, one Telegram note at end of turn).
+
+    `project` (a name) marks that project's validation as incomplete → excluded from the HEAD
+    baseline, so the next turn re-validates it instead of skipping a silently-unchecked tree.
+    """
+    DEGRADES.append(msg)
+    if project:
+        UNVALIDATED.add(project)
+    sys.stderr.write(f"shimpz-stdgate: {msg}\n")
+
+
+# Push a gate event to Juliano via shimpz-tg. Best-effort: surfaced on failure, never blocks the gate.
+# Module-global binding (not a bare call site) so the suite can stub it.
+_notify_owner = shimpzaudit.notify_owner
+
+
+def stdcheck_blocks(project_dir, timeout=120):
+    """Run `shimpz-stdcheck --json` as a SUBPROCESS and return its BLOCK findings shaped like ruff's.
+
+    `shimpz-stdcheck` is the sibling binary next to this gate, overridable via SHIMPZ_STDCHECK_BIN.
+    Findings are shaped as (severity, rule, file, line, msg, fix).
+
+    Exit 0 = clean, 2 = blocks; anything else, or unparseable output, means the scan DID NOT happen —
+    the project must NOT silently pass as standard-compliant, so we SURFACE it and leave THAT project
+    unvalidated (fail-open per project: siblings are still validated, so a real violation elsewhere this
+    turn still blocks).
+    """
+    stdcheck = os.environ.get("SHIMPZ_STDCHECK_BIN", str(HERE / "shimpz-stdcheck"))  # resolved at call time
+    try:
+        r = subprocess.run(
+            [sys.executable, stdcheck, "--json", project_dir],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        if r.returncode not in (0, 2):  # 0=clean, 2=blocks; anything else = error
+            raise RuntimeError("exit {}: {}".format(r.returncode, (r.stderr or "")[-300:].strip()))
+        data = json.loads(r.stdout)
+        keys = ("severity", "rule", "file", "line", "message", "fix")
+        return [tuple(b[k] for k in keys) for b in data["blocks"]]
+    except Exception as e:  # noqa: BLE001 — fail-open gate: surfaced, must not wedge the turn
+        _degrade(f"shimpz-stdcheck failed for {project_dir}: {e!r} (left UNVALIDATED)", project=Path(project_dir).name)
+        return []
+
+
+def _state_path():
+    return Path(os.environ.get("SHIMPZ_HOME", "/config/.shimpz")) / "stdgate-heads.json"
+
+
+def _head(d, run=subprocess.run):
+    """The project's current HEAD sha ('' when unreadable / not a repo)."""
+    try:
+        r = run(["git", "-C", str(d), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+        return (r.stdout or "").strip() if r.returncode == 0 else ""
+    except OSError, subprocess.SubprocessError:
+        return ""
+
+
+def _load_heads():
+    """Last-seen (post-sync) HEAD per project — {} when absent/corrupt (validate-everything, safe)."""
+    try:
+        data = json.loads(_state_path().read_text())
+        return data if isinstance(data, dict) else {}
+    except OSError, json.JSONDecodeError:
+        return {}
+
+
+def _save_heads(proot, run=subprocess.run, skip=frozenset()):
+    """Record each project's HEAD after a clean pass + sync — the baseline the NEXT turn diffs against.
+
+    `skip` (R90) names projects whose validation did NOT fully happen this turn: leaving them out of
+    the baseline makes changed_projects() pick them up again next turn (absent-from-seen → validate),
+    instead of a degraded turn granting a permanent pass to whatever it committed.
+    """
+    heads = {}
+    for d in sorted(Path(proot).glob("*")):
+        if d.name in skip:
+            continue
+        if d.is_dir() and not d.name.startswith(".") and (d / ".git").is_dir():
+            h = _head(d, run)
+            if h:
+                heads[d.name] = h
+    try:
+        _state_path().parent.mkdir(parents=True, exist_ok=True)
+        _state_path().write_text(json.dumps(heads))
+    except OSError as e:
+        sys.stderr.write(f"shimpz-stdgate: could not persist HEAD state: {e!r}\n")
+
+
+def changed_projects(proot, run=subprocess.run, seen=None):
+    """Project dirs in play this turn: no .git yet, a dirty tree, OR a HEAD that moved since last pass.
+
+    The HEAD comparison closes the manual-commit bypass: `git commit` mid-task leaves the tree clean,
+    but the sha no longer matches the recorded post-sync baseline (`seen`), so the project is still
+    validated. A project absent from `seen` (first run / new state file) is validated once — fail
+    toward checking. `run` is injectable so this is testable without a real git.
+    """
+    seen = seen or {}
+    out = []
+    for d in sorted(Path(proot).glob("*")):
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        if not (d / ".git").is_dir():
+            out.append(d)  # never committed → always validate
+            continue
+        try:
+            r = run(
+                ["git", "-C", str(d), "status", "--porcelain", "--untracked-files=all"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            if r.returncode != 0:
+                # Non-zero exit yields empty stdout → the project would be treated as unchanged and
+                # silently skipped from validation. Can't tell → validate (fail toward checking).
+                sys.stderr.write(
+                    f"shimpz-stdgate: git status exited {r.returncode} for {d}: "
+                    f"{(r.stderr or '').strip()[-200:]} (validating anyway)\n"
+                )
+                out.append(d)
+            elif (r.stdout or "").strip():
+                out.append(d)
+            elif _head(d, run) != seen.get(d.name):
+                out.append(d)  # clean tree but HEAD moved (or never recorded) → manual commit → validate
+        except (OSError, subprocess.SubprocessError) as e:
+            sys.stderr.write(f"shimpz-stdgate: git status failed for {d}: {e!r} (validating anyway)\n")
+            out.append(d)  # can't tell → validate (fail toward checking)
+    return out
+
+
+def waived_rules(last_text):
+    """Rule ids the agent waived this turn via STDCHECK_SKIP:<rule-id> tokens (empty set = none)."""
+    return set(_SKIP_RE.findall(last_text or ""))
+
+
+def gate_decision(blocks_by_project, waived):
+    """PURE decision: given per-project block findings and the waived rule ids, decide allow/block.
+
+    Returns ('allow', None) or ('block', reason). A waiver is RULE-SCOPED: STDCHECK_SKIP:<rule-id>
+    (parsed once per turn by waived_rules) drops only findings of that rule; anything else still
+    blocks. The bare token waives nothing — a blanket self-waiver in the model's own output was a
+    full gate bypass.
+    """
+    if waived:
+        blocks_by_project = {k: [f for f in v if f[1] not in waived] for k, v in blocks_by_project.items()}
+    blocking = {k: v for k, v in blocks_by_project.items() if v}
+    if not blocking:
+        return "allow", None
+    chunks = []
+    for name, blocks in blocking.items():
+        lines = "\n".join(f"    {f[2]}:{f[3]}  [{f[1]}] {f[4]}\n        → {f[5]}" for f in blocks)
+        chunks.append(f"  {name}:\n{lines}")
+    return "block", REASON % "\n".join(chunks)
+
+
+# One transcript parser for both Stop-hook gates (module-global binding so the suite can stub it).
+_last_assistant_text = shimpzprompt.last_assistant_text
+
+
+def _run_sync(path=None):
+    # The commit/push step. A failure here (sync absent, or it exits non-zero) must be SURFACED, not
+    # swallowed — a silent no-commit is exactly the kind of invisible degrade fail-fast forbids.
+    p = path or os.environ.get("SHIMPZ_PROJECT_SYNC", str(HERE / "shimpz-project-sync"))  # resolved at call time
+    try:
+        r = subprocess.run(["bash", p], check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        sys.stderr.write(f"shimpz-stdgate: sync invocation failed: {e!r}\n")
+        return
+    if r.returncode != 0:
+        sys.stderr.write(f"shimpz-stdgate: sync exited {r.returncode} (the commit may not have happened)\n")
+
+
+# The lint families every project MUST select (the scaffolded ruff.toml's core). A project may EXTEND
+# the canonical select (add families) but never shrink it — anything weaker, or no ruff.toml at all,
+# is scanned with the CANONICAL config shipped in the image instead (R89: before this, a hand-made
+# project fell back to ruff's near-empty defaults, so `shell=True` / naive datetimes sailed through).
+REQUIRED_RUFF_FAMILIES = ("F", "S", "DTZ", "ASYNC", "B", "BLE", "C901")
+
+
+def _canonical_ruff():
+    """The image-shipped canonical ruff config — the SAME file shimpz-new copies into every scaffold."""
+    return os.environ.get("SHIMPZ_RUFF_CANONICAL", str(HERE.parent / "share" / "shimpz-std" / "ruff.toml"))
+
+
+def _code_family(code):
+    """The alpha family prefix of a ruff code ('S602' → 'S', 'BLE001' → 'BLE', 'C901' → 'C')."""
+    m = re.match(r"[A-Z]+", str(code))
+    return m.group(0) if m else ""
+
+
+# Dirs that hold no first-party code (the SAME set shimpz-stdcheck prunes — a vendored ruff.toml inside
+# node_modules/.venv is a dependency's business, not project drift).
+_SKIP_DIRS = shimpzaudit.PROJECT_SKIP_DIRS
+# The required alpha families for code-level matching (C901 is a single code, not the C family —
+# C9xx codes are matched explicitly wherever _REQ_FAMILIES is consulted).
+_REQ_FAMILIES = {f for f in REQUIRED_RUFF_FAMILIES if not f.startswith("C")}
+_BLANKET_KEYS = ("*", "**", "**/*", "*.py", "**/*.py")
+
+
+def _source_py_files(project_dir):
+    """First-party, non-test, non-alembic .py relpaths — the files a weakened config could HIDE.
+
+    Used to judge whether an `exclude` / glob `per-file-ignores` entry actually covers real source
+    (weakening) or only generated/test trees (legitimate).
+    """
+    out = []
+    for dirpath, dirnames, filenames in os.walk(project_dir):
+        # vendor/shimpzbus is the ONE sanctioned vendored source (scaffolded in by shimpz-new/shimpz-bus,
+        # byte-verified against the canonical lib by shimpz-stdcheck) — dependency code, not first-party
+        # source. Without this prune the canonical config's own `extend-exclude = ["vendor"]` would
+        # read as "hides source" and every scaffolded project would be judged weakened.
+        dirnames[:] = [
+            d for d in dirnames if d not in _SKIP_DIRS and not (d == "shimpzbus" and Path(dirpath).name == "vendor")
+        ]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            rel = os.path.relpath(str(Path(dirpath) / fn), project_dir).replace(os.sep, "/")
+            base = Path(rel).name
+            if (
+                "/tests/" in f"/{rel}"
+                or "/alembic/" in f"/{rel}"
+                or base.startswith("test_")
+                or base.endswith("_test.py")
+                or base == "conftest.py"
+            ):
+                continue
+            out.append(rel)
+    return out
+
+
+def _glob_hits_source(pat, src_files):
+    """True if an exclude / per-file-ignores pattern covers at least one real source file.
+
+    fnmatch's `*` crosses `/` (unlike ruff's), so this over-matches slightly — erring toward
+    DETECTING a weakened config, never toward silently accepting one. A bare dir name ('app')
+    counts as its whole subtree, matching ruff's exclude semantics.
+    """
+    p = str(pat).strip().removeprefix("./")
+    if not p:
+        return False
+    prefix = p.rstrip("/") + "/"
+    return any(
+        f == p or f.startswith(prefix) or fnmatch.fnmatch(f, p) or fnmatch.fnmatch(f, "**/" + p) for f in src_files
+    )
+
+
+def _judge_ruff_table(cfg, src_files):
+    """The weakness verdict for ONE ruff config table → '' (upholds the standard) or the reason.
+
+    `cfg` is the table ruff reads: the whole file for ruff.toml/.ruff.toml, `tool.ruff` for
+    pyproject.toml. Legacy top-level keys (select/ignore/… outside [lint]) still work in ruff, so
+    they count exactly like their [lint] twins — a weakened select can't hide by being old-style.
+    Family matching is exact ('SIM' extensions never read as 'S'; only C9xx counts against C901).
+    """
+    lint = dict(cfg.get("lint") or {})
+    for k in ("select", "ignore", "per-file-ignores", "exclude"):
+        if k in cfg and k not in lint:
+            lint[k] = cfg[k]
+    sel = set(lint.get("select") or [])
+    dropped = [f for f in REQUIRED_RUFF_FAMILIES if f not in sel]
+    if dropped:
+        return "select drops " + ",".join(dropped)
+    hit = [str(c) for c in (lint.get("ignore") or []) if _code_family(c) in _REQ_FAMILIES or str(c).startswith("C9")]
+    if hit:
+        return "lint.ignore disables required codes: " + ",".join(hit)
+    pfi = lint.get("per-file-ignores") or {}
+    blanket = [k for k in pfi if k.strip() in _BLANKET_KEYS]
+    if blanket:
+        return "blanket per-file-ignores key " + ",".join(blanket)
+    for key, codes in pfi.items():
+        codes = [str(c) for c in (codes or [])]
+        if not any(_code_family(c) in _REQ_FAMILIES or c.startswith("C9") for c in codes):
+            continue
+        # an exact-path entry is the sanctioned narrow exemption; a GLOB that reaches real source
+        # while disabling required codes is a blanket in effect ('app/*' = ['S'] kills security
+        # lint for the whole app — the R90 bypass).
+        if any(ch in key for ch in "*?[") and _glob_hits_source(key, src_files):
+            return f"per-file-ignores glob '{key}' disables required codes across source files"
+    # exclude/extend-exclude hiding first-party source from the scan entirely (select stays intact,
+    # nothing is linted — the R90 bypass the select check can't see).
+    for key in ("exclude", "extend-exclude"):
+        for e in list(cfg.get(key) or []) + (list(lint.get("exclude") or []) if key == "exclude" else []):
+            if str(e).strip() in _BLANKET_KEYS or _glob_hits_source(e, src_files):
+                return f"{key} hides source files from the scan: {e}"
+    return ""
+
+
+def _ruff_config_files(project_dir):
+    """Every ruff config in the tree → [(Path, table|None)]; None = unreadable (judged weak).
+
+    Covers ruff.toml, .ruff.toml, and a pyproject.toml carrying [tool.ruff] — a pyproject without
+    that table configures nothing and is ignored. SKIP_DIRS pruned (vendored configs aren't ours).
+    """
+    out = []
+    for dirpath, dirnames, filenames in os.walk(project_dir):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for fn in filenames:
+            if fn not in (".ruff.toml", "ruff.toml", "pyproject.toml"):
+                continue
+            p = Path(dirpath) / fn
+            try:
+                cfg = tomllib.loads(p.read_text(encoding="utf-8"))
+            except OSError, ValueError:  # tomllib.TOMLDecodeError is a ValueError
+                out.append((p, None))
+                continue
+            if fn == "pyproject.toml":
+                cfg = (cfg.get("tool") or {}).get("ruff")
+                if cfg is None:
+                    continue  # a plain pyproject configures no ruff — not a config file
+            out.append((p, cfg))
+    return out
+
+
+def _project_ruff_status(project_dir):
+    """Judge the project's OWN ruff configuration → ('ok'|'missing'|'weak', detail).
+
+    'ok'      → normal discovery (extending the canonical select is welcome).
+    'missing' → no ruff config anywhere (hand-made project) → canonical enforced, no finding.
+    'weak'    → canonical enforced + a BLOCK finding (the drift itself must be repaired):
+                • the ROOT config (the file ruff would actually use: .ruff.toml > ruff.toml >
+                  pyproject [tool.ruff]) drops required families, globally ignores their codes,
+                  blanket-exempts files, or hides source via exclude — see _judge_ruff_table;
+                • ANY ruff config BELOW the root (R90): ruff's nearest-file discovery makes a
+                  nested config govern its subtree INSTEAD of the root one, so a compliant root
+                  ruff.toml + a weakened backend/ruff.toml silently un-linted the whole backend.
+                  The standard is ONE ruff config, at the project root — a nested one is drift
+                  even before reading it (and unreadable configs are drift too).
+    """
+    root = Path(project_dir).resolve()
+    configs = _ruff_config_files(root)
+    if not configs:
+        return "missing", "no ruff config"
+    weaks = []
+    root_cfgs = {p.name: cfg for p, cfg in configs if p.parent == root}
+    for p, _cfg in configs:
+        if p.parent != root:
+            weaks.append(f"nested ruff config {p.relative_to(root)} (one config, at the project root)")
+    # judge the config ruff would actually use at the root (discovery precedence order)
+    src_files = _source_py_files(root)
+    for name in (".ruff.toml", "ruff.toml", "pyproject.toml"):
+        if name not in root_cfgs:
+            continue
+        cfg = root_cfgs[name]
+        if cfg is None:
+            weaks.append(f"unreadable {name}")
+        else:
+            reason = _judge_ruff_table(cfg, src_files)
+            if reason:
+                weaks.append(f"{name}: {reason}")
+        break  # only the winning file governs; a shadowed sibling is dead config
+    if weaks:
+        return "weak", "; ".join(weaks)
+    return "ok", ""
+
+
+def ruff_blocks(project_dir, run=subprocess.run, timeout=120):
+    """The DETERMINISTIC standards gate: run `ruff check` over the project and turn violations into BLOCK findings.
+
+    A project whose own ruff.toml upholds the REQUIRED_RUFF_FAMILIES is scanned via normal config
+    discovery; a project with NO ruff.toml, or a WEAKENED one, is scanned with the canonical config
+    (`--config`) so the mandatory families are enforced no matter what — and a weakened file is
+    additionally surfaced as its own BLOCK finding. Each violation becomes a BLOCK finding shaped like
+    shimpz-stdcheck's (severity, rule, file, line, msg, fix). If ruff isn't installed, or errors, we
+    SURFACE that loudly (stderr + owner notify via DEGRADES) and return only the config finding —
+    a missing/broken linter must never wedge the loop, but the skip is never silent.
+    """
+    ruff = os.environ.get("SHIMPZ_RUFF_BIN", "ruff")
+    status, detail = _project_ruff_status(project_dir)
+    pre = []
+    # --no-cache: ruff writes its cache INTO the scanned project (<dir>/.ruff_cache). A project whose
+    # cache dir is owned by a foreign uid (a container-runtime user, or root leftovers from a live-test
+    # project like live-fs) makes ruff exit 2 on "Failed to create temporary file" — which degraded the
+    # WHOLE deterministic standards gate for the turn (fail-open). The gate must never depend on the
+    # scanned tree being writable by us; disabling the cache removes that surface entirely (negligible
+    # cost for a per-turn lint of changed projects).
+    cmd = [ruff, "check", "--output-format=json", "--quiet", "--no-cache"]
+    if status != "ok":
+        canonical = _canonical_ruff()
+        if Path(canonical).is_file():
+            cmd += ["--config", canonical]
+            if status == "weak":
+                pre.append(
+                    (
+                        "BLOCK",
+                        "ruff-config-weakened",
+                        "ruff.toml",
+                        1,
+                        f"the project's ruff configuration weakens the mandatory standards ({detail}) — "
+                        "the canonical config was enforced for this scan",
+                        "restore the scaffolded families (F,S,DTZ,ASYNC,B,BLE,C901,PLR09xx) in ONE root "
+                        "ruff.toml (remove nested/pyproject ruff configs); extend the select, never "
+                        "shrink it (an exact-path per-file-ignores entry for a genuine exemption)",
+                    )
+                )
+        else:
+            _degrade(
+                f"canonical ruff config missing at {canonical} — {project_dir} scanned with discovery only",
+                project=Path(project_dir).name,
+            )
+    cmd.append(project_dir)
+    pname = Path(project_dir).name
+    try:
+        r = run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        _degrade("ruff not installed — DETERMINISTIC standards NOT enforced this turn", project=pname)
+        return pre
+    except (OSError, subprocess.SubprocessError) as e:
+        _degrade(f"ruff could not run ({e!r}) — standards NOT enforced this turn", project=pname)
+        return pre
+    if r.returncode not in (0, 1):  # 0=clean, 1=violations; anything else = ruff error
+        _degrade(
+            "ruff error (rc={}): {} — standards NOT enforced this turn".format(r.returncode, (r.stderr or "")[-300:]),
+            project=pname,
+        )
+        return pre
+    try:
+        items = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError as e:
+        _degrade(f"ruff output unparseable ({e!r}) — standards NOT enforced this turn", project=pname)
+        return pre
+    out = []
+    for it in items:
+        rel = os.path.relpath(it.get("filename", ""), project_dir)
+        row = (it.get("location") or {}).get("row", 1)
+        out.append(
+            (
+                "BLOCK",
+                "ruff:%s" % (it.get("code") or "?"),
+                rel,
+                row,
+                it.get("message", ""),
+                "run `ruff check --fix` or fix manually",
+            )
+        )
+    return pre + out
+
+
+# ── loose-process gate (R90) ──────────────────────────────────────────────────────────────────────
+# CLAUDE.md forbids loose/background servers ("no &, nohup, setsid") — but that was prose with no
+# gate: a `nohup uvicorn … &` served traffic unsupervised, unaudited, and invisible to every deploy
+# gate. Ports 3100-3999 are the app range BY CONTRACT (shimpz-app enforces it at deploy), so any
+# LISTENing socket there that no supervised app claims IS a loose process — deterministically.
+
+
+def _listening_app_ports():
+    """Ports in 3100-3999 with a LISTENing TCP socket (v4+v6), read straight from /proc/net.
+
+    SHIMPZ_PROC_NET overrides the dir for tests. A read failure returns None (the caller degrades
+    loudly — 'could not check' must never scan as 'no loose processes').
+    """
+    base = Path(os.environ.get("SHIMPZ_PROC_NET", "/proc/net"))
+    ports = set()
+    for fn in ("tcp", "tcp6"):
+        try:
+            lines = (base / fn).read_text().splitlines()[1:]
+        except OSError:
+            return None
+        for line in lines:
+            parts = line.split()
+            # /proc/net/tcp columns: sl local_address rem_address st …; st 0A = LISTEN
+            if len(parts) < 4 or parts[3] != "0A":
+                continue
+            try:
+                port = int(parts[1].rsplit(":", 1)[1], 16)
+            except IndexError, ValueError:
+                continue
+            if 3100 <= port <= 3999:
+                ports.add(port)
+    return ports
+
+
+def _supervised_ports():
+    """Ports claimed by supervised apps ($SHIMPZ_HOME/supervisor/apps/*.conf carry PORT="<p>" lines)."""
+    apps = Path(os.environ.get("SHIMPZ_HOME", "/config/.shimpz")) / "supervisor" / "apps"
+    claimed = set()
+    for conf in apps.glob("*.conf"):
+        try:
+            text = conf.read_text(encoding="utf-8")
+        except OSError as e:
+            sys.stderr.write(f"shimpz-stdgate: unreadable app conf {conf}: {e!r}\n")
+            continue
+        claimed.update(int(m) for m in re.findall(r'PORT="(\d+)"', text))
+    return claimed
+
+
+def loose_process_blocks():
+    """BLOCK findings for every app-range listener no supervised app claims (shaped like stdcheck's)."""
+    listening = _listening_app_ports()
+    if listening is None:
+        _degrade("could not read /proc/net — loose-process check NOT run this turn")
+        return []
+    return [
+        (
+            "BLOCK",
+            "loose-process",
+            f"127.0.0.1:{p}",
+            0,
+            f"a process is LISTENING on app-port {p} but no supervised app claims that port — "
+            "a loose/nohup'd server (unsupervised, unaudited, dies with the session)",
+            f"deploy it properly (shimpz-app deploy <name> {p} -- <cmd>) or kill it; "
+            "never start a server with &/nohup/setsid",
+        )
+        for p in sorted(listening - _supervised_ports())
+    ]
+
+
+def _auditor_lock_alive(sentinel):
+    """True iff a LIVE auditor process genuinely holds the lock for `sentinel`.
+
+    The lock ($SHIMPZ_HOME/.<sentinel>.lock, holding the auditor's PID) is written by
+    shimpzaudit.run_auditor around the nested `claude` run and removed after. The env var alone is NOT
+    trusted (R89): it is inheritable/forgeable — any process could export SHIMPZ_SECAUDIT_RUNNING=1 and
+    silently disable this gate. A lockfile whose PID is alive cannot be forged from a transcript.
+    """
+    try:
+        pid = int(shimpzaudit.lock_path(sentinel).read_text().strip())
+    except OSError, ValueError:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # the PID exists (another uid) — alive
+    return True
+
+
+def main():
+    # Recursion guard: shimpz-secaudit / shimpz-logaudit / shimpz-skillaudit spawn a read-only `claude` auditor whose
+    # env carries SHIMPZ_SECAUDIT_RUNNING / SHIMPZ_LOGAUDIT_RUNNING / SHIMPZ_SKILLAUDIT_RUNNING = "1". That nested
+    # run's Stop hook is THIS gate. Without
+    # this no-op it would (a) run a full commit+push as a side effect of a supposedly read-only audit, and
+    # (b) BLOCK the auditor — which has only Read/Grep/Glob and cannot fix anything — wedging the audit
+    # until max-turns. R89: the env var is honored ONLY when the live auditor lock backs it — a bare
+    # env var was a silent full-gate bypass anyone (including the gated agent) could export.
+    for sentinel in ("SHIMPZ_SECAUDIT_RUNNING", "SHIMPZ_LOGAUDIT_RUNNING", "SHIMPZ_SKILLAUDIT_RUNNING"):
+        if os.environ.get(sentinel) == "1":
+            if _auditor_lock_alive(sentinel):
+                return
+            _degrade(f"{sentinel}=1 but NO live auditor holds its lock — bypass IGNORED, gate runs")
+    if os.environ.get("SHIMPZ_STDCHECK") == "0":  # kill-switch → just commit; the owner ALWAYS hears of it
+        _notify_owner("🧱 stdgate DISABLED this turn (SHIMPZ_STDCHECK=0) — committed with NO standards gate")
+        _run_sync()
+        return
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        data = {}
+    proot = os.environ.get("SHIMPZ_PROJECTS_DIR", "/config/workspace/projects")
+    if not Path(proot).is_dir():
+        _run_sync()
+        return
+    waived = waived_rules(_last_assistant_text(data.get("transcript_path", "")))
+    # Time budget: the Stop hook allots this gate a fixed window (settings.json). Before R89 the
+    # internal scans could outrun it — Claude Code then KILLS the hook mid-scan, the block decision is
+    # never emitted and the turn ends UNGATED (and uncommitted), silently, defeated by sheer volume.
+    # Now the gate spends at most SHIMPZ_STDGATE_BUDGET seconds (< the hook timeout) and anything left
+    # unscanned is a LOUD degradation, never a silent pass.
+    deadline = time.monotonic() + float(os.environ.get("SHIMPZ_STDGATE_BUDGET", "240"))
+    pending = changed_projects(proot, seen=_load_heads())
+    blocks_by_project = {}
+    for i, d in enumerate(pending):
+        left = deadline - time.monotonic()
+        if left <= 5:
+            _degrade("time budget exhausted — left UNVALIDATED this turn: " + ", ".join(p.name for p in pending[i:]))
+            UNVALIDATED.update(p.name for p in pending[i:])
+            break
+        blocks = stdcheck_blocks(d, timeout=min(120, left))  # the deterministic ecosystem-standard rules
+        left = max(5, deadline - time.monotonic())
+        blocks += ruff_blocks(d, timeout=min(120, left))  # + the deterministic ruff standards gate
+        blocks_by_project[d.name] = blocks
+    loose = loose_process_blocks()  # R90: a nohup'd server on an app port blocks the turn too
+    if loose:
+        blocks_by_project["(loose processes)"] = loose
+    decision, reason = gate_decision(blocks_by_project, waived)
+    if DEGRADES:  # every fail-open this turn reaches the owner — a degrade nobody sees is no gate (R80)
+        _notify_owner("⚠️ stdgate degraded this turn:\n• " + "\n• ".join(DEGRADES[:10]))
+    if decision == "block":
+        print(json.dumps({"decision": "block", "reason": reason}))
+        return  # withhold sync → violating code stays uncommitted; HEAD state NOT advanced
+    if waived and any(blocks_by_project.values()):  # a waiver actually let findings through → owner sees it
+        # every waiver reaches Juliano (Telegram) — a self-waiver the owner can't see is a bypass
+        _notify_owner("🧱 stdgate: rule waiver used this turn: " + ", ".join(sorted(waived)))
+    _run_sync()
+    # post-sync HEADs = the baseline the next turn diffs against; a project whose validation
+    # degraded this turn is NOT baselined, so the next turn re-validates it (R90).
+    _save_heads(proot, skip=frozenset(UNVALIDATED))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:  # noqa: BLE001 — fail-open gate: surfaced, must not wedge the turn
+        sys.stderr.write(f"shimpz-stdgate: internal error, failing open to sync: {e!r}\n")
+        _notify_owner(f"⚠️ stdgate internal error — failed OPEN to plain commit (no gate this turn): {e!r}")
+        _run_sync()  # fail-open: never wedge the loop on a gate bug
+        sys.exit(0)

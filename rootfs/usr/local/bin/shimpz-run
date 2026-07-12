@@ -1,0 +1,213 @@
+#!/opt/venv/bin/python
+"""shimpz-run — drive Shimpz's brain headless from the shell with a readable execution trace.
+
+PRODUCTION-FAITHFUL: it shares the brain-invocation constants + system prompts with the gateway
+(via shimpz-lib/shimpzprompt) and builds the SAME `claude` command (same model, same system prompt, same
+flags), so you instrument EXACTLY what Shimpz would do for a given message — but with a clean, greppable
+trace of every tool call, every line of Shimpz's text, and final tokens/cost. It does NOT load the
+gateway module, so it needs no Telegram token / OpenAI client (those are the gateway's runtime).
+
+  shimpz-run "task"                       one-shot; live trace of tools + Shimpz's words
+  shimpz-run --auto "task"                auto-answer shimpz-ask/shimpz-approve (public/first/ok) — unattended
+  shimpz-run --model <id> "task"          instrument a specific model
+  shimpz-run --max-turns N --timeout S "task"
+
+Run as the 'abc' user (claude refuses --dangerously-skip-permissions as root).
+"""
+
+import argparse
+import contextlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+# Load Shimpz's env exactly like the gateway (same helper), then import the SHARED brain-invocation
+# constants/protocols (shimpzprompt) — NOT the whole gateway, so no Telegram token / OpenAI client is
+# needed and shimpz-run doesn't inherit the gateway's runtime side effects.
+sys.path.insert(0, "/opt/shimpz-lib")
+import shimpzenv
+import shimpzipc
+import shimpzprompt
+
+shimpzenv.load()
+os.environ.setdefault("HOME", "/config")
+
+ap = argparse.ArgumentParser()
+ap.add_argument("task")
+ap.add_argument("--auto", action="store_true", help="auto-answer shimpz-ask/shimpz-approve")
+ap.add_argument("--model", default=os.environ.get("SHIMPZ_MODEL", "claude-sonnet-5"))
+ap.add_argument("--max-turns", type=int, default=shimpzprompt.SHIMPZ_MAX_TURNS)
+ap.add_argument("--timeout", type=int, default=shimpzprompt.CLAUDE_TIMEOUT)
+a = ap.parse_args()
+
+# mkdtemp: 0700 + unpredictable name (S108); only --auto uses it (created here, rmtree'd at exit)
+IPCDIR = Path(tempfile.mkdtemp(prefix="shimpz-run-ipc-")) if a.auto else None
+stop = threading.Event()
+
+
+def autopilot():
+    while not stop.is_set():
+        for rid, req, d in shimpzipc.pending(IPCDIR):  # shared queue reader (glob/parse/.bad in shimpzipc)
+            typ = d.get("type", "approve")
+            if typ == "ask":
+                opts = d.get("options") or []
+                pick = next(
+                    (o for o in opts if any(w in o.lower() for w in ("públic", "public", "sim", "yes"))),
+                    opts[0] if opts else "",
+                )
+                shimpzipc.answer(IPCDIR, rid, {"answer": pick})
+                print(
+                    f"  \033[35m[autopilot] ask {d.get('text', '')!r} -> {pick!r}\033[0m",
+                    flush=True,
+                )
+            else:
+                shimpzipc.answer(IPCDIR, rid, {"decision": "ok"})
+                print(
+                    f"  \033[35m[autopilot] {typ} {d.get('text', '')!r} -> ok\033[0m",
+                    flush=True,
+                )
+            shimpzipc.mark_sent(req)
+        time.sleep(0.4)
+
+
+# golden path lives in CLAUDE.md (auto-loaded); this only carries the runtime memory protocol
+cmd = shimpzprompt.brain_cmd(a.task, a.model, shimpzprompt.MEMORY_PROTOCOL, a.max_turns)
+env = shimpzenv.brain_env()
+env["SHIMPZ_MEMORY_DIR"] = str(shimpzprompt.MEMORY_DIR)
+env["SHIMPZ_SESSION_FRESH"] = "1"
+if a.auto:
+    env["SHIMPZ_IPC_DIR"] = str(IPCDIR)
+    threading.Thread(target=autopilot, daemon=True).start()
+
+
+def short(v, n=180):
+    s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+    s = s.replace("\n", "⏎")
+    return s if len(s) <= n else s[:n] + "…"
+
+
+print(f"\033[1m▶ shimpz-run\033[0m model={a.model} turns={a.max_turns} timeout={a.timeout}s auto={a.auto}")
+print(f"  task: {a.task}\n" + "─" * 72, flush=True)
+t0 = time.time()
+proc = subprocess.Popen(
+    cmd,
+    cwd=shimpzprompt.WORKDIR,
+    env=env,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    bufsize=1,
+    text=True,
+)
+
+# Drain stderr CONCURRENTLY. The main thread only reads stdout; stderr is a PIPE with a ~64KB kernel
+# buffer. A --verbose run (MCP logs, node warnings, API-retry spam) can write >64KB to stderr before
+# it ends → the child blocks on write(2), stops emitting stdout, and the stdout loop hangs until the
+# watchdog kills an otherwise-live run (masquerading as a timeout). This keeps the last ~256KB.
+_stderr_tail = []
+
+
+def _drain_stderr():
+    while True:
+        chunk = proc.stderr.read(65536)
+        if not chunk:
+            return
+        _stderr_tail.append(chunk)
+        if len(_stderr_tail) > 4:
+            del _stderr_tail[:-4]
+
+
+threading.Thread(target=_drain_stderr, daemon=True).start()
+
+
+def watchdog():
+    if stop.wait(a.timeout):
+        return
+    print(f"\n  \033[31m[timeout {a.timeout}s] killing brain\033[0m", flush=True)
+    with contextlib.suppress(OSError):
+        proc.kill()
+
+
+threading.Thread(target=watchdog, daemon=True).start()
+
+# None until a `result` event lands. A run killed by the watchdog (timeout) or that crashes/OOMs
+# before emitting `result` leaves sub=None → we exit NON-ZERO. Initializing to "success" would make a
+# timed-out/killed run indistinguishable from a clean one to any script/battle-test reading the code.
+sub = None
+try:
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            evt = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        match evt.get("type"):
+            case "system" if evt.get("subtype") == "init":
+                print(
+                    f"· init session={str(evt.get('session_id', ''))[:8]} "
+                    f"model={evt.get('model', '')} tools={len(evt.get('tools', []))}",
+                    flush=True,
+                )
+            case "assistant":
+                for blk in evt.get("message", {}).get("content", []):
+                    if blk.get("type") == "text" and blk.get("text", "").strip():
+                        print("\n\033[36m» " + blk["text"].strip() + "\033[0m", flush=True)
+                    elif blk.get("type") == "tool_use":
+                        inp = blk.get("input", {})
+                        key = (
+                            inp.get("command")
+                            or inp.get("file_path")
+                            or inp.get("url")
+                            or inp.get("description")
+                            or inp
+                        )
+                        print(
+                            f"  \033[33m⮑ {blk.get('name')}\033[0m: {short(key)}",
+                            flush=True,
+                        )
+            case "user":
+                for blk in evt.get("message", {}).get("content", []):
+                    if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                        c = blk.get("content")
+                        if isinstance(c, list):
+                            c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                        print(f"    \033[90m= {short(c, 220)}\033[0m", flush=True)
+            case "result":
+                sub = evt.get("subtype", "success")
+                u = evt.get("usage", {}) or {}
+                print("─" * 72)
+                print(
+                    f"\033[1m✓ result [{sub}]\033[0m {time.time() - t0:.0f}s  "
+                    f"in={u.get('input_tokens', '?')} out={u.get('output_tokens', '?')} "
+                    f"cost=${evt.get('total_cost_usd', '?')}"
+                )
+                r = (evt.get("result") or "").strip()
+                if r:
+                    print("\n\033[1mFINAL:\033[0m\n" + r)
+except KeyboardInterrupt:
+    proc.kill()
+finally:
+    stop.set()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            proc.kill()
+    if a.auto:
+        shutil.rmtree(IPCDIR, ignore_errors=True)
+err = ("".join(_stderr_tail))[-800:]  # from the concurrent drainer (child has exited → tail is final)
+if err.strip():
+    print("\nSTDERR(tail):\n" + err, file=sys.stderr)
+if sub is None:
+    print(
+        f"\n\033[31m✗ no result event — run killed/crashed before finishing (rc={proc.returncode})\033[0m",
+        file=sys.stderr,
+    )
+sys.exit(0 if sub == "success" else 1)

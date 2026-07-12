@@ -1,0 +1,23 @@
+# Shimpz's INTERNAL reverse proxy: hostname (Host header) → a local app port. It sits behind the
+# single Cloudflare Tunnel — one wildcard ingress (*.zyon.network → http://shimpz-brain:8080) fans every
+# app domain in here, so adding a domain never needs a tunnel/dashboard edit. TLS is terminated
+# at Cloudflare's edge, so Caddy serves PLAIN HTTP and auto_https is OFF (never let it try to mint
+# certs from inside the container). Shimpz adds one site file per domain via `shimpz-route` and reloads
+# through the admin API. Listens on :8080 only — never published to the host (origin stays invisible).
+{
+	admin localhost:2019
+	auto_https off
+	persist_config off
+	log {
+		output file /config/.shimpz/logs/caddy-access.log
+		level WARN
+	}
+}
+
+# Default catch-all so an unmapped Host gets a clean 404 instead of a connection error.
+http://:8080 {
+	respond "shimpz-brain: no app routed for this host" 404
+}
+
+# Per-domain routes live here, one file each (written by `shimpz-route add`).
+import /config/.shimpz/caddy/sites/*.caddy

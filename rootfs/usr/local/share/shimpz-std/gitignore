@@ -1,0 +1,14 @@
+# Shimpz default .gitignore — secrets + heavy build artifacts, never committed
+.env
+.env.*
+!.env.example
+node_modules/
+.venv/
+__pycache__/
+*.py[cod]
+.svelte-kit/
+.output/
+build/
+dist/
+*.log
+.DS_Store

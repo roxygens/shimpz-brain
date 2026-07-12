@@ -1,0 +1,38 @@
+# THE CANONICAL project standards gate — the single source of the mandatory ruff config.
+# shimpz-new copies this file into every scaffolded project; shimpz-stdgate enforces THIS file (via
+# `ruff --config`) on any project whose own ruff.toml is absent or weakened, so a hand-made project
+# or an edited-down select can never drop the S/DTZ/ASYNC/B/BLE families silently (R89).
+# Families (all verified real): F=pyflakes, S=security, DTZ=tz-aware datetime, ASYNC=async pitfalls,
+# B=bugbear, BLE=blind-except (no "Pokémon" catch-all), C901=cyclomatic complexity, PLR09xx=function shape.
+target-version = "py312"
+
+# Vendored dependencies are not project code: vendor/shimpzbus (the ONE sanctioned vendored source,
+# copied in by shimpz-new/shimpz-bus) follows the REPO's own ruff standard, not this per-project profile.
+# Content integrity of vendor/shimpzbus is enforced by shimpz-stdcheck's byte-identity gate, not by lint.
+extend-exclude = ["vendor"]
+
+[lint]
+select = ["F", "S", "DTZ", "ASYNC", "B", "BLE", "C901",
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915"]
+
+[lint.mccabe]
+max-complexity = 10          # a function over McCabe 10 must be split (mature-project default)
+
+[lint.pylint]
+max-args = 5                 # PLR0913
+max-branches = 12            # PLR0912
+max-returns = 6              # PLR0911
+max-statements = 50          # PLR0915
+
+[lint.per-file-ignores]
+# assert (S101) is legitimate in tests; alembic env/versions are generated boilerplate.
+# Keys are **-prefixed ON PURPOSE: they must match no matter which directory anchors the config
+# (this file is also enforced from /usr/local/share via `ruff --config`).
+"**/tests/**" = ["S101"]
+"**/test_*.py" = ["S101"]
+"**/alembic/**" = ["S", "F", "B", "DTZ", "BLE", "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915"]
+
+[lint.flake8-bugbear]
+# FastAPI's Depends()/Query()/... in argument defaults are the intended pattern, not the B008 bug.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Header",
+    "fastapi.Cookie", "fastapi.Body", "fastapi.Form", "fastapi.File", "fastapi.Security"]

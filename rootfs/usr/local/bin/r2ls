@@ -1,0 +1,40 @@
+#!/opt/venv/bin/python
+"""r2ls [prefix] — list objects in the R2 bucket (size + modtime + path).
+
+  r2ls            -> everything
+  r2ls uploads/   -> only the uploads/ prefix
+
+SECURITY_ENGINEERING_PLAN.md item 7: the listing runs in the `r2-driver` container (which holds
+the R2 secret); this just calls its restricted API (shimpzr2). A genuinely-missing prefix is reported as
+such — never masked as "(empty)", which would be exactly the bug-hiding fallback this repo forbids.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+sys.path.insert(0, os.environ.get("SHIMPZ_LIB", "/opt/shimpz-lib"))
+import shimpzr2  # shared r2-driver HTTP client (see /opt/shimpz-lib/shimpzr2.py)
+
+
+def main() -> None:
+    prefix = sys.argv[1] if len(sys.argv) > 1 else ""
+    print(f"R2:{prefix}")
+    try:
+        result = shimpzr2.list_prefix(prefix)
+    except shimpzr2.R2DriverError as exc:
+        if "HTTP 404" in str(exc):
+            print("(nonexistent prefix)")
+            return
+        sys.exit(f"r2ls: {exc}")
+    entries = result["entries"]
+    if not entries:
+        print("(empty prefix)")
+        return
+    for e in entries:
+        print(f"{e['size']:>12}  {e['modtime']}  {e['path']}")
+
+
+if __name__ == "__main__":
+    main()

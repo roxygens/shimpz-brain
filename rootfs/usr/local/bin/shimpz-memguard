@@ -1,0 +1,147 @@
+#!/opt/venv/bin/python
+"""Stop hook — MANDATORY memory write-back (bounded, smart).
+
+When Claude tries to finish a task, this fires. If the task did SUBSTANTIAL work (at least
+MIN_WORK work-tool calls) but nothing was written to the memory store, we BLOCK the stop exactly
+once and instruct Claude to distill durable learnings into a playbook/fact. The model can answer
+NOTHING_TO_SAVE to opt out — so trivial work never bloats memory. A per-session sentinel
+guarantees we block at most once, so there is no infinite loop.
+
+The nudge costs a whole extra paid brain turn, so it must not fire on every turn: a handful of
+tool calls is a lookup/quick answer with nothing durable to learn (it used to nudge — and get
+NOTHING_TO_SAVE back — on a single `ls`). We deliberately do NOT force a write when no tools
+were used (pure conversational answer).
+"""
+
+import json
+import logging
+import os
+import re
+import sys
+from pathlib import Path
+
+log = logging.getLogger("shimpz-memguard")
+
+MEM = os.environ.get("SHIMPZ_MEMORY_DIR", "/config/.shimpz/memory")
+GUARD = Path(MEM) / ".memguard"
+
+
+def _bash_writes_mem(command: str) -> bool:
+    """True iff a bash command WRITES into the memory dir with MEM as the TARGET.
+
+    A write means a redirection (`>`/`>>`) or `tee` whose destination is under MEM.
+    Deliberately CONSERVATIVE and asymmetric on purpose:
+
+    - The old bare-substring check counted READS (`cat/grep/ls <MEM>/…` — exactly what shimpz-recall tells the
+      model to run) as saves, neutering the write-back guard on the very sessions that consulted memory.
+    - It does NOT try to parse cp/mv/rsync/install/dd argument positions: there MEM is often the SOURCE
+      (a READ, e.g. `cp <MEM>/x /tmp/out`), and miscounting that as a save is the exact bug the gate caught.
+
+    Erring toward 'not a write' is safe: a missed bash-write only makes the guard fire ONE extra nudge
+    (the model can reply NOTHING_TO_SAVE). A read miscounted as a save silently disables the guard — the
+    failure mode we must never allow. Real memory writes are expected via Write/Edit (handled separately)
+    or a redirect/tee, both of which put MEM unambiguously as the target.
+    """
+    mem = re.escape(MEM.rstrip("/"))
+    # `> MEM/…`, `>>MEM/…`, `tee MEM/…`, `tee -a MEM/…`, `… | tee MEM/…` — MEM immediately after the
+    # write operator (never merely somewhere in a read pipeline like `grep x MEM/f > /tmp/out`).
+    return bool(re.search(r'(?:>>?\s*|\btee\b(?:\s+-\S+)*\s+)"?' + mem + "/", command or ""))
+
+
+def _into_mem(p: str) -> bool:
+    """True iff `p` is genuinely INTO the memory dir at a PATH BOUNDARY — the dir itself, or a path under it.
+
+    NOT a bare substring match.
+
+    A substring `MEM in path` meant a broad SHIMPZ_MEMORY_DIR (e.g. `/config`) marked a mere sibling
+    ('/config-backup/…') as 'saved' and silently disabled the guard. Reads MEM live so it tracks a
+    reassignment.
+    """
+    mem = MEM.rstrip("/")
+    return bool(p) and (p == mem or p.startswith(mem + "/"))
+
+
+# tools that signify the agent actually DID something worth possibly remembering
+WORK_TOOLS = {"bash", "write", "edit", "notebookedit", "webfetch", "websearch", "task"}
+# Fewer work-tool calls than this = a trivial turn (quick lookup / one-liner) → never nudged.
+# ~8 is the smallest real task (navigate + act + verify + fix); env-tunable.
+MIN_WORK = int(os.environ.get("SHIMPZ_MEMGUARD_MIN_WORK", "8"))
+
+
+def allow():
+    sys.exit(0)  # empty stdout + exit 0 = let it stop
+
+
+def block(reason):
+    print(json.dumps({"decision": "block", "reason": reason}))
+    sys.exit(0)
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except json.JSONDecodeError, OSError:
+        allow()
+    sid = data.get("session_id") or "nosession"
+    tpath = data.get("transcript_path") or ""
+    sentinel = GUARD / sid
+    if sentinel.exists():
+        allow()  # already nudged this session
+
+    work_calls = 0
+    saved = False
+    if tpath and Path(tpath).is_file():
+        try:
+            with Path(tpath).open(encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if '"tool_use"' not in line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg = ev.get("message") or {}
+                    for blk in msg.get("content") or []:
+                        if not isinstance(blk, dict) or blk.get("type") != "tool_use":
+                            continue
+                        name = (blk.get("name") or "").lower()
+                        inp = blk.get("input") or {}
+                        path = str(inp.get("file_path") or inp.get("path") or "")
+                        if name in ("write", "edit", "notebookedit") and _into_mem(path):
+                            saved = True
+                        # writing to memory via shell counts too — but only a WRITE (redirect/tee/cp/mv
+                        # into MEM), never a read (cat/grep/ls of MEM), which would neuter the guard.
+                        if name == "bash" and _bash_writes_mem(str(inp.get("command") or "")):
+                            saved = True
+                        if name in WORK_TOOLS:
+                            work_calls += 1
+        except OSError:
+            allow()
+
+    if work_calls >= MIN_WORK and not saved:
+        try:
+            GUARD.mkdir(parents=True, exist_ok=True)
+            sentinel.write_text("")
+        except OSError:
+            allow()
+        block(
+            "Before finishing, SAVE to long-term memory only the learnings that will make you "
+            "faster and more accurate on this SAME task or similar ones: the procedure that "
+            "worked, exact selectors/coordinates/URLs/commands, gotchas and failures to avoid. "
+            f"Use Write/Edit on {MEM}/playbooks/<slug>.md (procedural) or {MEM}/facts/<slug>.md "
+            "(semantic). If a playbook for this already exists, REFINE it — don't duplicate. "
+            "Don't save chit-chat, one-off results, or secrets. Saving is SILENT internal "
+            "bookkeeping: do NOT narrate or announce it — the user already got the answer, and "
+            "any text you emit now would REPLACE that answer on their screen. After saving, "
+            "reply only: MEMORY_SAVED. If there is truly nothing durable to learn, reply only: "
+            "NOTHING_TO_SAVE."
+        )
+    allow()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # fail-open: Stop hook must never block the agent from finishing (logged, not silent)
+        log.exception("shimpz-memguard failed; allowing stop")
+        sys.exit(0)

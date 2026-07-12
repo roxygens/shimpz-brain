@@ -1,0 +1,37 @@
+#!/opt/venv/bin/python
+"""shimpz-shot [outfile] — capture the LIVE desktop straight from the X11 framebuffer.
+
+This is Shimpz's eyes: ground-truth pixels, taken OUTSIDE the browser (no CDP, no
+Page.captureScreenshot) so it's invisible to the page and shows what the DOM hides (overlays,
+invisible reCAPTCHA, real rendered state). After any action, shoot again and LOOK to verify it
+actually happened — never trust "the code said it worked".
+
+SECURITY_ENGINEERING_PLAN.md item 0: the X11 root window lives in the `shimpz-browser` container now
+— this calls browser-agent's /v1/browser/screenshot and writes the returned PNG bytes locally.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ.get("SHIMPZ_LIB", "/opt/shimpz-lib"))
+import shimpzbrowser  # shared browser-agent HTTP client (see /opt/shimpz-lib/shimpzbrowser.py)
+
+
+def main() -> None:
+    out = sys.argv[1] if len(sys.argv) > 1 else "/config/workspace/_shot.png"
+    try:
+        png, headers = shimpzbrowser.call_bytes("GET", "/v1/browser/screenshot")
+    except shimpzbrowser.BrowserAgentError as exc:
+        sys.exit(f"ERROR: could not capture the screen: {exc}")
+    Path(out).write_bytes(png)
+    print(out)
+    # Report the screen size so coordinates are unambiguous: the desktop is locked, so a pixel
+    # in THIS screenshot maps 1:1 to a uiclick/shimpz-input click coordinate. Use these exact pixels.
+    geo = headers.get("X-Screen-Geometry")
+    if geo:
+        print(f"screen: {geo} — coordinates of this screenshot == click coordinates (uiclick). Do not rescale.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,160 @@
+#!/opt/venv/bin/python
+"""shimpz-tempcred — 0600 + TTL scratch storage for credentials passed to Shimpz MANUALLY during a task.
+
+SECURITY_ENGINEERING_PLAN.md item 2's third clause: a credential Juliano pastes into a
+conversation for a one-off task (not a permanent infra secret like Cloudflare/Postgres/Redpanda,
+which live in their own sidecars) must never sit in the agent's global env for the rest of the
+session — it goes here instead: 0600, a short TTL, and swept away automatically.
+
+  shimpz-tempcred set <name> [--ttl SECONDS] [--value VALUE]   store it (from --value, else stdin —
+                                                             stdin so the secret never appears in
+                                                             `ps`/shell history as an argument)
+  shimpz-tempcred get <name>                                   print the value if not expired
+  shimpz-tempcred list                                         name + remaining TTL, NEVER values
+  shimpz-tempcred clear [name]                                 delete one, or ALL if no name given
+  shimpz-tempcred sweep                                        delete every EXPIRED entry (idempotent)
+
+Storage: $SHIMPZ_HOME/.tempcreds/<name>.json (dir 0700, file 0600) — {value, created_at, expires_at}.
+Default TTL 3600s (1h) — override with --ttl. `sweep` runs from the Stop hook (scripts/sync.sh)
+after every turn, so an expired credential is deleted within one turn of Shimpz's own session, not
+left to rot for the rest of a long-running container's uptime.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_DEFAULT_TTL = 3600
+
+
+def _store_dir() -> Path:
+    shimpz_home = Path(os.environ.get("SHIMPZ_HOME", "/config/.shimpz"))
+    d = shimpz_home / ".tempcreds"
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o700)
+    return d
+
+
+def _validate_name(name: str) -> str:
+    if not _NAME_RE.match(name):
+        sys.exit(f"name must match {_NAME_RE.pattern!r}: {name!r}")
+    return name
+
+
+def _path_for(name: str) -> Path:
+    return _store_dir() / f"{_validate_name(name)}.json"
+
+
+def _read(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    # PEP 758 (Python 3.14, this repo's pinned version): a comma-separated except list needs no
+    # parens — equivalent to `except (json.JSONDecodeError, OSError):`. Verified: `ast.parse` and a
+    # real run both succeed; `ruff format` (this repo's canonical formatter) itself rewrites a
+    # parenthesized tuple into exactly this shape, so this is the STANDARD style here, not a
+    # Python-2 leftover.
+    except json.JSONDecodeError, OSError:
+        return None
+
+
+def cmd_set(a):
+    value = a.value if a.value is not None else sys.stdin.readline().rstrip("\n")
+    if not value:
+        sys.exit("no value given (pass --value or pipe it on stdin)")
+    now = time.time()
+    record = {"value": value, "created_at": now, "expires_at": now + a.ttl}
+    path = _path_for(a.name)
+    path.write_text(json.dumps(record))
+    path.chmod(0o600)
+    print(f"stored {a.name!r}, expires in {a.ttl}s")
+
+
+def cmd_get(a):
+    path = _path_for(a.name)
+    record = _read(path)
+    if record is None:
+        sys.exit(f"no credential named {a.name!r}")
+    if time.time() >= record["expires_at"]:
+        path.unlink(missing_ok=True)
+        sys.exit(f"credential {a.name!r} expired — deleted, not printed")
+    print(record["value"])
+
+
+def cmd_list(_a):
+    now = time.time()
+    entries = sorted(_store_dir().glob("*.json"))
+    if not entries:
+        print("(no temp credentials stored)")
+        return
+    for path in entries:
+        record = _read(path)
+        if record is None:
+            continue
+        name = path.stem
+        remaining = int(record["expires_at"] - now)
+        status = f"expires in {remaining}s" if remaining > 0 else "EXPIRED (not yet swept)"
+        print(f"{name}\t{status}")
+
+
+def cmd_clear(a):
+    if a.name:
+        path = _path_for(a.name)
+        if path.exists():
+            path.unlink()
+            print(f"cleared {a.name!r}")
+        else:
+            print(f"nothing stored for {a.name!r}")
+        return
+    count = 0
+    for path in _store_dir().glob("*.json"):
+        path.unlink()
+        count += 1
+    print(f"cleared {count} temp credential(s)")
+
+
+def cmd_sweep(_a):
+    now = time.time()
+    swept = 0
+    for path in _store_dir().glob("*.json"):
+        record = _read(path)
+        if record is None or now >= record["expires_at"]:
+            path.unlink(missing_ok=True)
+            swept += 1
+    print(f"swept {swept} expired credential(s)")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="shimpz-tempcred")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("set")
+    s.add_argument("name")
+    s.add_argument("--ttl", type=int, default=_DEFAULT_TTL)
+    s.add_argument("--value", default=None)
+    s.set_defaults(fn=cmd_set)
+
+    g = sub.add_parser("get")
+    g.add_argument("name")
+    g.set_defaults(fn=cmd_get)
+
+    sub.add_parser("list").set_defaults(fn=cmd_list)
+
+    c = sub.add_parser("clear")
+    c.add_argument("name", nargs="?")
+    c.set_defaults(fn=cmd_clear)
+
+    sub.add_parser("sweep").set_defaults(fn=cmd_sweep)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

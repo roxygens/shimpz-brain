@@ -1,0 +1,147 @@
+#!/opt/venv/bin/python
+"""shimpz-input — PHYSICAL mouse/keyboard with HUMAN-like motion, over browser-agent.
+
+Why this exists: a plain teleporting mousemove+click is the single most damning bot signal. The
+WindMouse human-motion algorithm (wind + gravity + inertia), random landing jitter, and typing
+timing all still apply — they just run server-side now (browser-agent/xtest_client.py), since the
+X11 display is a Unix domain socket inside the `shimpz-browser` container (unreachable from here).
+
+Usage:
+  shimpz-input move   X Y
+  shimpz-input click  X Y [left|right|middle]
+  shimpz-input dclick X Y
+  shimpz-input type   "text"
+  shimpz-input key    ctrl+l            # key combos / single keys (xdotool syntax)
+  shimpz-input scroll up|down [amount]
+  shimpz-input pos                      # print current cursor X Y
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.environ.get("SHIMPZ_LIB", "/opt/shimpz-lib"))
+import shimpzbrowser  # shared browser-agent HTTP client (see /opt/shimpz-lib/shimpzbrowser.py)
+
+
+def pos() -> tuple[int, int]:
+    r = shimpzbrowser.call_json("GET", "/v1/browser/pos")
+    return r["x"], r["y"]
+
+
+def move(dx: int, dy: int) -> tuple[int, int]:
+    shimpzbrowser.call_json("POST", "/v1/browser/move", {"x": dx, "y": dy})
+    return dx, dy
+
+
+def click(dx: int, dy: int, button: str = "left") -> None:
+    shimpzbrowser.call_json("POST", "/v1/browser/click", {"x": dx, "y": dy, "button": button, "count": 1})
+
+
+def dclick(dx: int, dy: int) -> None:
+    shimpzbrowser.call_json("POST", "/v1/browser/dclick", {"x": dx, "y": dy})
+
+
+def type_text(text: str) -> None:
+    shimpzbrowser.call_json("POST", "/v1/browser/type", {"text": text})
+
+
+def scroll(direction: str, amount: int = 3) -> None:
+    shimpzbrowser.call_json("POST", "/v1/browser/scroll", {"direction": direction, "amount": int(amount)})
+
+
+def _coords_and_extra(args: list[str]) -> tuple[list[str], list[str]]:
+    """Split args into (numeric-tokens, other-tokens), tolerating the model's natural coordinate formatting.
+
+    `816 649`, `816,649`, `816, 649` all yield ['816','649'].
+
+    A trailing word like a mouse button ('right') lands in the extra list. PURE, so the parsing is
+    unit-tested without a network call.
+    """
+    toks = [t for t in " ".join(args).replace(",", " ").split() if t]
+    nums = [t for t in toks if t.lstrip("-").isdigit()]
+    extra = [t for t in toks if not t.lstrip("-").isdigit()]
+    return nums, extra
+
+
+def _scroll_args(a: list[str]) -> tuple[str, int]:
+    """Validated (direction, amount) for `scroll` — a bad arg raises ValueError/IndexError."""
+    if not a:
+        raise IndexError("scroll needs a direction (e.g. `scroll down 3`)")
+    direction = a[0]
+    if direction not in ("up", "down"):
+        raise ValueError(f"scroll direction must be up|down, got {direction!r}")
+    amount = int(a[1]) if len(a) > 1 else 3  # a non-numeric amount is a bad arg → ValueError → usage
+    if amount <= 0:  # `range(<=0)` scrolls nothing — a silent no-op the model can't debug
+        raise ValueError(f"scroll amount must be a positive integer, got {amount}")
+    return direction, amount
+
+
+def _parse_action(cmd, a):
+    """Resolve (cmd, args) into a zero-arg action callable.
+
+    Raises ValueError/IndexError on a bad CLI arg (main turns those into a one-line usage);
+    prints + exits 2 on an unknown command.
+    """
+    match cmd:
+        case "move" | "click" | "dclick":
+            nums, extra = _coords_and_extra(a)
+            if len(nums) < 2:
+                raise ValueError(f"need x and y (e.g. `{cmd} 816 649`)")
+            x, y = int(nums[0]), int(nums[1])
+            btn = extra[0] if extra else "left"
+            action = {
+                "move": lambda: move(x, y),
+                "dclick": lambda: dclick(x, y),
+                "click": lambda: click(x, y, btn),
+            }[cmd]
+        case "type":
+            if not a:
+                raise IndexError('type needs text (e.g. `type "hello"`)')
+            text = a[0]
+
+            def action():
+                return type_text(text)
+        case "key":
+            if not a:
+                raise IndexError("key needs a key/combo (e.g. `key ctrl+l`)")
+            combo = a[0]
+
+            def action():
+                return shimpzbrowser.call_json("POST", "/v1/browser/key", {"combo": combo})
+        case "scroll":
+            direction, amount = _scroll_args(a)
+
+            def action():
+                return scroll(direction, amount)
+        case "pos":
+
+            def action():
+                return print(*pos())
+        case _:
+            print(f"unknown command: {cmd}", file=sys.stderr)
+            sys.exit(2)
+    return action
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(2)
+    cmd = sys.argv[1]
+    a = sys.argv[2:]
+    # ONLY argument parsing lives in the guard. A bad CLI arg (ValueError/IndexError) becomes a one-line
+    # usage the model can act on — but execution runs OUTSIDE the guard, so a genuine bug inside
+    # move()/click()/type_text()/pos() (including browser-agent being unreachable) still surfaces as a
+    # real error (fail-fast, never masked as "bad arguments"). _parse_action resolves the command into
+    # a zero-arg `action`; we run it below.
+    try:
+        action = _parse_action(cmd, a)
+    except (ValueError, IndexError) as e:
+        # never dump a Python traceback at the model — a one-line usage is debuggable, a traceback isn't.
+        print(f"shimpz-input: bad arguments ({e})\n{__doc__}", file=sys.stderr)
+        sys.exit(2)
+    action()  # execute OUTSIDE the guard — a real internal error surfaces, it is NOT masked as a bad arg
+
+
+if __name__ == "__main__":
+    main()

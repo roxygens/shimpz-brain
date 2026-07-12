@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# md2pdf <input.md> [output.pdf]
+#   Markdown -> professional PDF via Pandoc + WeasyPrint (no JS, deterministic, never blank).
+#   Applies the house theme. The first `# Heading` becomes the running header title.
+set -euo pipefail
+in="${1:?usage: md2pdf <input.md> [output.pdf]}"
+out="${2:-${in%.*}.pdf}"
+[ -f "$in" ] || { echo "ERROR: file not found: $in" >&2; exit 1; }
+
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+# Pandoc -> HTML FRAGMENT (no standalone title block, so the running header comes from
+# the document's own first <h1>, not the filename). Wrap in a minimal doc, then hand the
+# WeasyPrint render + theme + anti-blank guard to html2pdf (the single PDF render path).
+body="$(pandoc "$in" --from gfm --to html5)"
+printf '<!doctype html><html lang="pt"><head><meta charset="utf-8"></head><body>\n%s\n</body></html>\n' \
+    "$body" > "$tmp/doc.html"
+html2pdf "$tmp/doc.html" "$out"

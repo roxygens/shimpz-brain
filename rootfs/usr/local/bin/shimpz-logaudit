@@ -1,0 +1,194 @@
+#!/opt/venv/bin/python
+"""shimpz-logaudit — the JUDGMENT code-standards gate for `shimpz-app deploy`.
+
+After the deterministic gate (ruff + shimpz-stdcheck) BLOCKs the mechanical issues, summon an independent,
+READ-ONLY auditor that judges the two SEMANTIC things a linter cannot: (A) OBSERVABILITY — if this breaks
+in prod, do the structured logs let the agent debug it from EVIDENCE (via `logq trace`) instead of a
+guess? — and (B) DB/PYTHON STANDARDS a linter can't see (a non-UUIDv7 PK, a naive-typed timestamp column,
+money-as-float, a FK with no ondelete/index, an N+1 access, an unbounded query, a missing transaction
+boundary). It flags CONCRETE violations and returns the EXACT fix for each.
+
+Contract differs from shimpz-secaudit ON PURPOSE: logging findings are not a decision for Juliano, they're a
+FIX. So a non-clean verdict is exit 2 with actionable fixes, and shimpz-app ABORTS the deploy printing them —
+the agent auto-corrects (adds the log) and re-deploys. Worst case of a marginal finding is one extra log
+line (harmless), so auto-correction is safe here (unlike a security block).
+
+Default model = Sonnet (logging judgment is cheaper than threat-modeling; override SHIMPZ_LOGAUDIT_MODEL).
+Read-only (`--allowedTools Read,Grep,Glob`). Kill-switch SHIMPZ_LOGAUDIT=0. Fail-OPEN (exit 1) on its own
+error — a logging audit hiccup must never block a deploy (it is not a security boundary), but it is
+surfaced LOUDLY, never silent.
+
+Exit: 0 CLEAN · 2 FINDINGS (auto-fixable) · 1 audit could-not-run (fail-open at the caller).
+Usage: shimpz-logaudit <backend-dir> [--json]
+"""
+
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.environ.get("SHIMPZ_LIB", "/opt/shimpz-lib"))
+import shimpzaudit  # shared auditor plumbing (collect/extract/run)
+
+MODEL = os.environ.get("SHIMPZ_LOGAUDIT_MODEL", "sonnet")
+TIMEOUT = int(os.environ.get("SHIMPZ_LOGAUDIT_TIMEOUT", "420"))
+MAX_BYTES = shimpzaudit.DEFAULT_MAX_BYTES
+SENTINEL = "SHIMPZ_LOGAUDIT_RUNNING"  # set in the sub-run's env so its own hooks know not to recurse
+
+PROTOCOL = (
+    "You are the DEPLOY CODE-STANDARDS AUDITOR for an autonomous agent. You judge the SEMANTIC things a "
+    "linter cannot, and return the EXACT fix for each: (A) OBSERVABILITY — can the agent debug this from "
+    "STRUCTURED LOGS (structlog JSON, correlated by trace_id via `logq trace`) instead of a guess? — (B) "
+    "DB/PYTHON SEMANTIC STANDARDS — (C) STRUCTURE / DRY / TEST-ADEQUACY — and (D) SERVICE REUSE & "
+    "DECOUPLING against the live service registry. A deterministic gate (ruff + "
+    "shimpz-stdcheck) already BLOCKS the MECHANICAL issues — print(), `except: pass`, blind except, missing "
+    "logging setup(), naive datetime, mutable defaults, raw SQL, eval/pickle/shell=True, assert, high "
+    "complexity/too-many-args, oversized files — so do NOT re-report any of those. Judge only the semantic gaps.\n\n"
+    "You may Read/Grep/Glob the backend below. EXECUTE EVERY STEP:\n"
+    "1) Enumerate the routes/handlers, DB models, and significant operations (external calls, DB mutations, "
+    "auth decisions, background/worker steps, error branches).\n"
+    "2) OBSERVABILITY — for each op, ask: if this FAILS in prod, is there a log line with enough context "
+    "(ids, the operation, the error) to SEE what happened via `logq trace`? Flag:\n"
+    "   • an except/error branch that catches an exception but logs NOTHING (or without the exception "
+    "context) — the failure would be invisible;\n"
+    "   • an important operation (payment, external API call, auth/permission decision, destructive "
+    "mutation, a retry/fallback) with no log at all;\n"
+    "   • a log clearly UNPARSEABLE/uncorrelated (built by string concatenation, not structured key/values).\n"
+    "3) DB/PYTHON STANDARDS — flag ONLY a concrete violation of these mandates (never the mechanical ones a "
+    "linter owns):\n"
+    "   • a DB model PRIMARY KEY that is NOT a server-side UUIDv7 — e.g. a Python-side default=uuid.uuid4 / a "
+    "random v4 / a client-supplied id. Standard: mapped_column(primary_key=True, server_default=func.uuidv7());\n"
+    "   • a timestamp COLUMN typed as a naive DateTime (no timezone=True) — must be DateTime(timezone=True);\n"
+    "   • a MONEY / precise-decimal column typed as Float — must be Numeric or integer cents;\n"
+    "   • a ForeignKey with NO explicit ondelete, or a FK column with no index=True;\n"
+    "   • an N+1 access: a relationship lazy-loaded inside a loop, or (async) a lazy relationship accessed "
+    "without selectinload/await (the MissingGreenlet trap);\n"
+    "   • an UNBOUNDED query on a growable table (a select/query with no LIMIT / pagination);\n"
+    "   • a multi-statement DB mutation with NO explicit transaction boundary (with session.begin()).\n"
+    "4) STRUCTURE, DRY & TESTS — a linter already BLOCKs complexity / too-many-args / blind-except / "
+    "oversized files, so flag ONLY the semantic gaps it CANNOT see:\n"
+    "   • clear DUPLICATION — the same non-trivial logic copy-pasted in 2+ places (extract a shared "
+    "function/component);\n"
+    "   • a module / route / component doing TOO MANY unrelated things — should be split by responsibility;\n"
+    "   • over-abstraction — a needless layer / indirection / base class with a single caller (YAGNI);\n"
+    "   • a frontend page that inlines a repeated block instead of a reusable component;\n"
+    "   • a route that MUTATES persistent data, moves MONEY, or makes an AUTH/permission decision and has "
+    "NO corresponding test anywhere in tests/ — this IS a finding (the backend ships a ready pytest "
+    "structure with rollback fixtures, so an untested money/auth/mutation path is not acceptable); a trivial "
+    "getter / health check / simple public read does NOT need a test.\n"
+    "4b) REUSE & DECOUPLING (the microservice law) — Read the service-registry manifests (the "
+    "directory in env SHIMPZ_REGISTRY, default /config/workspace/registry: one JSON per registered service "
+    "with name/description/topics). Flag:\n"
+    "   • code that RE-IMPLEMENTS a capability an already-registered service provides (its own client "
+    "for the same third-party API, its own consumer/engine for the same domain events) — the fix is "
+    "shimpzbus.call('<svc>', ...) or subscribing to its topics, and deploying with `shimpz-app deploy "
+    "--calls <svc>`;\n"
+    "   • a THIRD-PARTY integration (ads platform, payments, messaging, an external SaaS API) embedded "
+    "inside a web-tier project — a capability other projects could plausibly reuse belongs in its OWN "
+    "internal service (own project/DB/secrets, registered internal=True), with the web project emitting "
+    "domain events instead. A truly one-off, project-specific external call is NOT a finding (calibrate).\n"
+    "5) CALIBRATE HARD — this is the whole point. Do NOT demand a log on every line, a test on a trivial "
+    "getter, or nitpick a 2-line repeat. A getter, a pure helper, a health check, a simple public read need "
+    "neither logs nor tests; a config/DTO model has no PK mandate. Flag ONLY a CONCRETE, worth-fixing "
+    "violation. If the code is adequate, return ok=true with NO findings — that is the common result.\n\n"
+    "For each finding give the exact location (file + function/route/model), the one-line ISSUE, and the "
+    'exact FIX (e.g. `log.exception("charge_failed", order_id=order.id)` in the except of charge(); or '
+    "`server_default=func.uuidv7()` on the id column; or `Numeric(12, 2)` instead of Float).\n\n"
+    "OUTPUT — emit ONLY this JSON object, nothing else:\n"
+    '{"ok": true|false, "findings":[{"location":"file.py:func","issue":"what failure goes '
+    'invisible","fix":"the exact log call to add + where"}], "reason":"one tight sentence"}'
+)
+
+
+def parse_verdict(stdout):
+    """Pull the verdict out of the raw auditor stdout (envelope-aware).
+
+    Unreadable → ERROR (never a silent CLEAN).
+    """
+    v = shimpzaudit.extract_json_obj(stdout, required_key="ok")
+    if not v or "ok" not in v:
+        return {"ok": None, "reason": "unparseable auditor output", "error": True}
+    if not isinstance(v["ok"], bool):
+        # A non-bool `ok` (e.g. the model emitting the string "false") must NEVER be coerced with
+        # Python truthiness — bool("false") is True, which would certify a findings verdict as CLEAN
+        # and deploy without the fixes. Treat it as unparseable → error → fail-open at the caller.
+        return {"ok": None, "reason": f"non-boolean ok={v['ok']!r}", "error": True}
+    v.setdefault("findings", [])
+    return v
+
+
+def run_logaudit(backend_dir, runner=subprocess.run):
+    """Summon the read-only logging auditor. `runner` is injectable so tests never spawn a real model.
+
+    Returns a dict: {ok: bool} on success, or {error: True, reason} on a run/parse failure (fail-open at
+    the caller). A CLEAN verdict over TRUNCATED source is downgraded to findings=[] but ok stays as given
+    only if the model saw the whole thing — truncation flips ok→None (treated as could-not-fully-audit).
+    """
+    payload, truncated, err = shimpzaudit.judge(
+        backend_dir,
+        PROTOCOL,
+        "BACKEND UNDER LOGGING AUDIT",
+        model=MODEL,
+        timeout=TIMEOUT,
+        sentinel=SENTINEL,
+        max_turns=24,
+        max_bytes=MAX_BYTES,
+        runner=runner,
+    )
+    if err is not None:
+        return {"error": True, "reason": err}  # fail-OPEN at the caller
+    v = parse_verdict(payload)
+    if v.get("error"):
+        return v
+    if truncated and v.get("ok"):
+        # a CLEAN verdict over TRUNCATED source isn't trustworthy — a later file may hold the gap. Don't
+        # block the deploy on it (logging isn't a security boundary), but do NOT certify CLEAN: treat as
+        # could-not-fully-audit → fail-open with a surfaced reason.
+        return {
+            "error": True,
+            "reason": "backend source exceeded the audit size limit and was TRUNCATED — logging audit incomplete",
+        }
+    return v
+
+
+# exit code: shimpz-app treats 0 as proceed, 2 as ABORT-with-fixes (agent auto-corrects), 1 as fail-open (warn).
+def format_human(v):
+    if v.get("error"):
+        return "🪵 CODE AUDIT — could not run: {}".format(v.get("reason", "?"))
+    if v.get("ok"):
+        return "🪵 CODE AUDIT — clean (%s)" % (v.get("reason") or "logging + standards adequate")
+    findings = v.get("findings") or []
+    out = [f"🪵 CODE AUDIT — {len(findings)} gap(s) to fix before deploy:"]
+    out.extend(
+        "  • {}\n      issue: {}\n      fix: {}".format(f.get("location", "?"), f.get("issue", ""), f.get("fix", ""))
+        for f in findings
+    )
+    if v.get("reason"):
+        out.append("  {}".format(v["reason"]))
+    return "\n".join(out)
+
+
+def main(argv):
+    target, as_json = shimpzaudit.cli_arg(argv, "usage: shimpz-logaudit <backend-dir> [--json]")
+    if target is None:
+        return 64
+    if shimpzaudit.kill_switch("SHIMPZ_LOGAUDIT", target, "logging audit"):
+        print(
+            json.dumps({"ok": True, "findings": [], "reason": "skipped (SHIMPZ_LOGAUDIT=0)"})
+            if as_json
+            else "logging audit skipped (SHIMPZ_LOGAUDIT=0)"
+        )
+        return 0
+    v = run_logaudit(target)
+    print(json.dumps(v) if as_json else format_human(v))
+    if v.get("error"):
+        return 1  # fail-OPEN at the caller (never block a deploy on a hiccup)
+    return 0 if v.get("ok") else 2  # 2 → findings → shimpz-app aborts with fixes (auto-correct)
+
+
+if __name__ == "__main__":
+    # recursion guard: if WE are already inside an audit's sub-run, do nothing.
+    if os.environ.get(SENTINEL) == "1" or os.environ.get("SHIMPZ_SECAUDIT_RUNNING") == "1":
+        print('{"ok":true,"findings":[],"reason":"nested audit no-op"}')
+        sys.exit(0)
+    sys.exit(main(sys.argv[1:]))

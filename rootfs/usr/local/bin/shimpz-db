@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# shimpz-db — per-project Postgres isolation. Each project gets its OWN database `proj_<name>` on the
+# shared Postgres 18 server, so projects NEVER share tables and can be dropped independently. The
+# infra DB (`shimpz-brain`) is off-limits to projects — always give a project its own DB.
+#
+# ISOLATION IS BY PRIVILEGE, not just by name: each project also gets a least-privilege LOGIN role
+# `proj_<name>` that OWNS only its own database (apps are NEVER the Postgres superuser), and only that
+# role may CONNECT to it. So a SQLi/RCE in one published app can't read or drop another project's data
+# or the infra DB. The printed DATABASE_URL uses that scoped role — use it as-is.
+#
+#   shimpz-db create <name>   create database proj_<name> (idempotent); prints its DATABASE_URL
+#   shimpz-db url <name>      print the DATABASE_URL for proj_<name>
+#   shimpz-db list            list project databases (proj_*)
+#   shimpz-db psql <name>     open a psql shell on proj_<name>
+#   shimpz-db drop <name>     DROP database proj_<name> (asks for approval first)
+#
+# SECURITY_ENGINEERING_PLAN.md item 2: the Postgres SUPERUSER DSN (SHIMPZ_PG_DSN) now lives ONLY in
+# pg-driver — `shimpz-brain` never holds it. create/url/list/drop go through that restricted, audited
+# HTTP API (pgdriver.sh). `psql` needs no superuser access at all: it derives the project's OWN
+# least-privilege proj_<name> credential via `url` and connects with THAT directly — a compromised
+# `shimpz-brain` can only ever touch the ONE project database it's actively debugging, never another
+# project's data or the infra DB.
+set -euo pipefail
+. "${SHIMPZ_LIB:-/opt/shimpz-lib}/shimpzdetect.sh"   # shared _sanitize_proj (MUST match shimpz-app's DSN gate)
+. "${SHIMPZ_LIB:-/opt/shimpz-lib}/pgdriver.sh"
+
+# proj_<name> — same sanitize_proj identity pg-driver itself will independently derive server-side.
+dbname(){ printf 'proj_%s' "$(_sanitize_proj "$1")"; }
+
+# _psql_connect <database-url> [extra psql args...]  — parses a postgresql://user:pass@host:port/db
+# URL into psql's own -h/-p/-U/-d flags + PGPASSWORD, then execs (replaces this process; no
+# superuser credential ever touches this script for the `psql` subcommand's connection itself).
+_psql_connect(){
+  local url="$1"; shift || true
+  local rest creds hostpart user pass hostport host port db
+  rest="${url#*://}"; creds="${rest%%@*}"; hostpart="${rest#*@}"
+  user="${creds%%:*}"; pass="${creds#*:}"
+  hostport="${hostpart%%/*}"; db="${hostpart#*/}"
+  host="${hostport%%:*}"; port="${hostport##*:}"
+  [ "$port" = "$host" ] && port=5432
+  PGPASSWORD="$pass" exec psql -h "$host" -p "$port" -U "$user" -d "$db" "$@"
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  create)
+    n="${1:?usage: shimpz-db create <name>}"
+    out=$(_pgdriver_create "$n")
+    echo "DATABASE_URL=$(echo "$out" | jq -r '.database_url')"
+    [ "$(echo "$out" | jq -r '.created')" = "true" ] && echo "created: $(dbname "$n")" || echo "db already exists: $(dbname "$n")" ;;
+  url)  _pgdriver_url "${1:?need <name>}" ;;
+  list) _pgdriver_list ;;
+  query)
+    name="${1:?usage: shimpz-db query <name> \"<SQL>\"}"; shift
+    sql="${1:?need a SQL string, e.g. shimpz-db query salesnator_meta \"SELECT count(*) FROM waitlist_signups\"}"
+    out=$(_pgdriver_query "$name" "$sql") || exit 1
+    echo "$out" | jq -r '.csv'
+    [ "$(echo "$out" | jq -r '.truncated')" = "true" ] && echo "-- (truncated at the row cap; add LIMIT to refine)" >&2 ;;
+  psql) name="${1:?need <name>}"; shift; url=$(_pgdriver_url "$name"); _psql_connect "$url" "$@" ;;  # pass-through extra args (-c "SQL", -f, -tAc…)
+  drop)
+    n="${1:?need <name>}"; db="$(dbname "$n")"
+    if command -v shimpz-approve >/dev/null 2>&1; then
+      shimpz-approve "DROP DATABASE $db + its role — deletes ALL data of project $n" || { echo "cancelled"; exit 1; }
+    fi
+    out=$(_pgdriver_drop "$n")
+    echo "dropped: $(echo "$out" | jq -r '.dropped')" ;;
+  *) echo "usage: shimpz-db create|url|list|query|psql|drop <name>" >&2; exit 2 ;;
+esac

@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+# shimpz-app — deploy/manage Shimpz's OWN web apps as PER-APP CONTAINERS via shimpz-driver
+# (SECURITY_ENGINEERING_PLAN.md 1/1.1). This is ONLY for apps Shimpz builds in
+# /config/workspace/projects; infra services stay in s6/autostart. `shimpz-brain` itself never touches
+# Docker or writes app processes locally — every deploy/lifecycle call goes through the
+# restricted, allowlisted, audited shimpz-driver API (shimpzdriver.sh).
+#
+#   shimpz-app deploy [--worker] [--persist] [--calls <a,b>] <name> <port> -- <command...>
+#       supervise <command> as a container app_<name>, $PORT/$HOST exported.
+#       --worker: a pure bus consumer (shimpzbus run_worker) that binds NO HTTP port — its
+#         post-deploy smoke checks the container STAYS RUNNING instead of probing a port.
+#       --persist: give the app its OWN writable volume at /data (only apps that genuinely
+#         need to persist files beyond their own database should opt in — SECURITY_ENGINEERING_PLAN.md 2).
+#   shimpz-app list                                   docker ps of every app container
+#   shimpz-app status <name>                          one app's container state
+#   shimpz-app restart|start|stop <name>
+#   shimpz-app logs <name> [N]                        tail last N lines (default 80)
+#   shimpz-app rm <name> [--purge]                    stop + remove the app (and its /data volume with --purge)
+#
+# <command> is run as argv (NOT a shell) inside the app's OWN container — for pipes/&&/env-
+# expansion wrap it in: bash -lc "...". The app's port is exported as $PORT/$HOST. Example:
+#   shimpz-app deploy landing 3101 -- uv run uvicorn app:app --host 0.0.0.0 --port 3101
+set -euo pipefail
+# Validate an app name on EVERY subcommand that reaches the driver — a name is
+# interpolated into the driver's URL path and (there) into a container/volume name.
+_valid_name(){ case "$1" in ''|*[!A-Za-z0-9_-]*) echo "shimpz-app: name must be [A-Za-z0-9_-]" >&2; exit 2;; esac; }
+
+# Shared helpers (ONE source of truth with shimpz-publish/shimpz-db): _owner_note, the backend/SvelteKit
+# detection rules (_haspy/_svelte_server_files/_isbackend), _projroot and the proj_<name> sanitizer.
+. "${SHIMPZ_LIB:-/opt/shimpz-lib}/shimpzdetect.sh"
+# shimpz-driver HTTP client (_driver_deploy/_driver_lifecycle/_driver_status/_driver_logs/_driver_health/
+# _driver_rm/_driver_route_apply/_driver_route_del) — the ONLY way this script touches app containers.
+. "${SHIMPZ_LIB:-/opt/shimpz-lib}/shimpzdriver.sh"
+
+# SECURITY GATE (item 3): audit EVERY backend deploy (anything with a .py), not just public publish, with
+# NO command-based skip. Juliano opted into "audit every shimpz-app deploy", and ANY command-string heuristic
+# for "is this just a worker?" is exploitable: an allow-list (uvicorn/…) misses a flask/http.server backend,
+# and a deny-list (shimpzbus/run_worker) is bypassed by an INCIDENTAL substring — `uvicorn shimpzbus_gateway:app`
+# is a real web backend that a deny-list would skip UNAUDITED. So the ONLY skip is STRUCTURAL (no .py = a
+# static dir = no Python route surface), which a command cannot forge. shimpz-secaudit honors SHIMPZ_SECAUDIT=0
+# (kill-switch) and is read-only. set +e around the capture: shimpz-secaudit exits 2/3/1 for REVIEW/UNSAFE/
+# ERROR, which `set -e` would otherwise treat as fatal.
+#
+# R132 — the gate BLOCKS + explains; Shimpz FIXES; the gate NEVER asks Juliano to rubber-stamp a vuln. A
+# security hole is a FIX, not a decision to approve (routing it to a human bypass-button just trains the
+# owner to rubber-stamp real vulnerabilities). A non-SAFE verdict ABORTS the deploy printing the auditor's
+# own exact fix; Shimpz auto-corrects and re-deploys, and the re-deploy RE-RUNS this audit, so a fix that
+# doesn't truly close the hole simply blocks again — the vuln cannot ship unless it's genuinely resolved.
+# (Replaces R129/R130's owner-approval ledger, which is deleted: there is no owner prompt here anymore.)
+# Whether a surviving finding is a false positive / an accepted-risk business decision is SHIMPZ's call to
+# escalate to Juliano in HIS language (via shimpz-ask) — not a hardcoded English prompt from this CLI.
+_deploy_secgate(){  # $1=dir $2=name $3=port $4=run-command (kept for log context)
+  _isbackend "$1" || return 0            # not a backend (static / no .py) → nothing to threat-model
+  echo "▶ security audit of $1 (deploy) …"
+  local attfile; attfile="${SHIMPZ_HOME:-/config/.shimpz}/state/secaudit-attempts-$2"
+  # --app makes the auditor EXPOSURE-AWARE (R129): a service whose registry manifest says
+  # internal=true is judged against its REAL surface (declared consumers only — the publish gate
+  # forecloses the internet), so a non-SAFE verdict is far more likely a REAL, fixable exposure.
+  local audit arc; set +e; audit=$(shimpz-secaudit "$1" --json --app "$2"); arc=$?; set -e
+  if [ "$arc" -eq 0 ]; then echo "  security audit: SAFE"; rm -f "$attfile"; return 0; fi
+
+  local human verdict
+  human=$(printf '%s' "$audit" | jq -r '"🔒 SECURITY AUDIT — \(.verdict) (risk: \(.risk // "?"))\n"
+      + ([.findings[]? | "  • [\(.owasp // "?")] \(.route // "?")\n      attack: \(.attack // "")\n      fix: \(.fix // "")"] | join("\n"))
+      + (if .reason then "\n  \(.reason)" else "" end)' 2>/dev/null) || human="$audit"
+  [ -n "$human" ] || human="$audit"
+  verdict=$(printf '%s' "$audit" | jq -r '.verdict // "ERROR"' 2>/dev/null) || verdict="ERROR"
+
+  # ERROR = the audit COULD NOT RUN (outage/rate-limit/unparseable — frequent while out of credits).
+  # NOT a known vuln and NOT something Shimpz can "fix" — but shipping a backend UNAUDITED is itself a
+  # security hole, so fail CLOSED (block) and say plainly this is an OUTAGE, not a code defect: retry
+  # when the auditor recovers, or (only if truly needed) re-run with the explicit SHIMPZ_SECAUDIT=0
+  # kill-switch. No owner prompt from the gate — Shimpz decides whether to involve Juliano, in his language.
+  if [ "$verdict" = "ERROR" ]; then
+    echo "$human" >&2
+    echo "  🔒 deploy BLOCKED: the security auditor could NOT run (outage) — a backend must not ship unaudited." >&2
+    echo "  This is an auditor outage, NOT a code fix: retry when it recovers, or re-run with SHIMPZ_SECAUDIT=0 to skip." >&2
+    exit 1
+  fi
+
+  # A REAL finding (REVIEW/UNSAFE). BLOCK + hand back the auditor's exact fix so Shimpz auto-corrects.
+  # A per-app attempt counter keyed by the STRUCTURAL fingerprint (verdict + sorted (owasp,route) set —
+  # the model rephrases the prose every run) escalates the ADVICE after repeated failures: a finding
+  # that keeps surviving Shimpz's fixes may be a false positive or an accepted-risk decision, so tell Shimpz
+  # to ASK Juliano (his language, via shimpz-ask) rather than loop forever. The gate still only ever blocks.
+  local fp prev_fp prev_n n escalate
+  fp=$(printf '%s' "$audit" | jq -S '{v:.verdict, k:([.findings[]? | {o:.owasp, r:.route}] | sort)}' 2>/dev/null | sha256sum | cut -d" " -f1) || fp=""
+  prev_fp=""; prev_n=0
+  [ -f "$attfile" ] && { prev_fp=$(cut -d' ' -f1 "$attfile" 2>/dev/null); prev_n=$(cut -d' ' -f2 "$attfile" 2>/dev/null); }
+  if [ -n "$fp" ] && [ "$fp" = "$prev_fp" ]; then n=$((prev_n + 1)); else n=1; fi
+  escalate="${SHIMPZ_SECAUDIT_ESCALATE_AFTER:-3}"
+  mkdir -p "${SHIMPZ_HOME:-/config/.shimpz}/state"
+  [ -n "$fp" ] && printf '%s %s\n' "$fp" "$n" > "$attfile"
+
+  echo "$human" >&2
+  echo "  🔒 deploy BLOCKED by the security gate — this is a REAL exposure, NOT a decision to approve." >&2
+  echo "  FIX the vulnerability above (the auditor gave the exact fix), then re-deploy — the re-deploy re-audits." >&2
+  if [ "$n" -ge "$escalate" ]; then
+    echo "  ⚠️ this SAME finding has now survived $n deploys. If it is a FALSE POSITIVE or an accepted-risk" >&2
+    echo "  business decision (not something to fix in code), ASK Juliano via shimpz-ask — in his language —" >&2
+    echo "  whether to accept it (he can authorize SHIMPZ_SECAUDIT=0 for this one deploy). Do NOT keep looping." >&2
+  fi
+  exit 1
+}
+
+# AFFIRMATIVE DSN GATE (R90): nothing verified that a project actually uses ITS OWN isolated DB.
+# stdcheck only catches the literal infra `/shimpz-brain` DSN in committed source; the .env (gitignored, never
+# scanned) could point at ANOTHER project's proj_<x> or an external host and every gate stayed green —
+# the exact cross-project sharing CLAUDE.md forbids. So at deploy: if the project's .env declares a
+# DATABASE_URL, it must be PostgreSQL, on the local server (the compose `postgres` service), and its
+# database must be THIS project's `proj_<name>` (same sanitizer as shimpz-db). No DATABASE_URL → nothing
+# claimed → skip (a static front / script needs no DB). SHIMPZ_DSNCHECK=0 kill-switches it, owner-notified.
+# (shimpz-driver RE-VALIDATES the same rule server-side before deploying — defense in depth in case
+# this client-side gate is ever bypassed or this script is skipped.)
+_deploy_dsngate(){  # $1=resolved app dir (project root or backend/) $2=project root
+  if [ "${SHIMPZ_DSNCHECK:-1}" = 0 ]; then
+    _owner_note "⚠️ SHIMPZ_DSNCHECK=0 — DSN isolation gate SKIPPED for $1"; return 0
+  fi
+  local root="$2" proj envf="" dsn rest hostport host db expected
+  proj=$(basename "$root")
+  for envf in "$1/.env" "$root/.env"; do [ -s "$envf" ] && break; envf=""; done  # -s (non-empty), not -f: a stray empty backend/.env must not shadow the real one at root
+  [ -n "$envf" ] || return 0
+  dsn=$(sed -n 's/^DATABASE_URL=//p' "$envf" | head -1)
+  dsn="${dsn%\"}"; dsn="${dsn#\"}"; dsn="${dsn%\'}"; dsn="${dsn#\'}"
+  [ -n "$dsn" ] || return 0
+  case "$dsn" in postgres://*|postgresql://*|postgresql+*://*) : ;; *)
+    echo "shimpz-app: DATABASE_URL in $envf is not PostgreSQL — the standard is an isolated proj_<name>" \
+         "Postgres DB (shimpz-db create $proj)" >&2; exit 2;; esac
+  rest="${dsn#*://}"; case "$rest" in *@*) hostport="${rest#*@}";; *) hostport="$rest";; esac
+  host="${hostport%%[:/]*}"
+  case "$hostport" in */*) db="${hostport#*/}"; db="${db%%\?*}";; *) db="";; esac
+  expected="proj_$(_sanitize_proj "$proj")"   # same sanitizer as shimpz-db (shimpzdetect.sh)
+  case "$host" in postgres|127.0.0.1|localhost) : ;; *)
+    echo "shimpz-app: DATABASE_URL in $envf points at host '$host' — project DBs live on the local" \
+         "Postgres only (host 'postgres'); an external/foreign DB breaks the isolation standard" >&2; exit 2;; esac
+  if [ "$db" != "$expected" ]; then
+    echo "shimpz-app: DATABASE_URL in $envf points at database '${db:-<none>}' but this project's isolated DB" \
+         "is '$expected' — cross-project/infra DBs are forbidden (shimpz-db create $proj → put its URL in $envf)" >&2; exit 2
+  fi
+  echo "  DSN gate: $expected on local postgres ✓"
+}
+
+# SECRETS-PER-DOMAIN gate (SECURITY_ENGINEERING_PLAN.md item 3): a project's .env must NEVER declare
+# one of Shimpz's own global agent secrets — an app compromise must only ever leak that app's OWN secrets,
+# never Cloudflare/GitHub/OpenAI/Telegram/Anthropic tokens. shimpz-driver's env allowlist would also
+# reject any of these server-side (defense in depth), but this catches it deterministically, pre-deploy,
+# naming the exact offending key — before any HTTP round-trip.
+_FORBIDDEN_GLOBAL_ENV_KEYS="SHIMPZ_CF_TOKEN CF_TUNNEL_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY VOICE_TOOLS_OPENAI_KEY GITHUB_TOKEN TELEGRAM_BOT_TOKEN SHIMPZ_PG_DSN"
+_deploy_secretgate(){  # $1=dir $2=root
+  local dir="$1" root="$2" envf="" k
+  for envf in "$dir/.env" "$root/.env"; do [ -s "$envf" ] && break; envf=""; done  # -s: see _deploy_dsngate's note
+  [ -n "$envf" ] || return 0
+  for k in $_FORBIDDEN_GLOBAL_ENV_KEYS; do
+    if grep -q "^${k}=" "$envf" 2>/dev/null; then
+      echo "shimpz-app: $envf declares '$k' — this is one of Shimpz's own GLOBAL agent secrets and must" \
+           "NEVER appear in a project's .env (an app compromise must only ever leak that app's own" \
+           "secrets, never Shimpz's). Remove it." >&2
+      exit 2
+    fi
+  done
+}
+
+# PAYMENT LOCK (L1, defense-in-depth atop the L2 egress pin): an app's .env must NEVER carry a payment-
+# processor credential — payment is locked to ShimpzPay (declare [billing], charge via the pay-
+# driver). Kept in sync with shimpzmanifest.py::PAYMENT_KEYS (drift-locked by test-shimpz-app-paygate.sh).
+_FORBIDDEN_PAYMENT_ENV_KEYS="STRIPE_API_KEY STRIPE_SECRET_KEY STRIPE_PUBLISHABLE_KEY STRIPE_WEBHOOK_SECRET STRIPE_RESTRICTED_KEY PAYPAL_CLIENT_ID PAYPAL_CLIENT_SECRET PAYPAL_SECRET BRAINTREE_PRIVATE_KEY ADYEN_API_KEY RAZORPAY_KEY_SECRET MERCADOPAGO_ACCESS_TOKEN PAGARME_API_KEY MOLLIE_API_KEY PADDLE_API_KEY LEMONSQUEEZY_API_KEY SQUARE_ACCESS_TOKEN"
+_deploy_paygate(){  # $1=dir $2=root
+  local dir="$1" root="$2" envf="" k
+  for envf in "$dir/.env" "$root/.env"; do [ -s "$envf" ] && break; envf=""; done
+  [ -n "$envf" ] || return 0
+  for k in $_FORBIDDEN_PAYMENT_ENV_KEYS; do
+    if grep -q "^${k}=" "$envf" 2>/dev/null; then
+      echo "shimpz-app: $envf declares '$k' — an app cannot hold a payment-processor credential. Payment is" \
+           "locked to ShimpzPay: declare [billing] in shimpz.app.toml and charge via the pay-driver" \
+           "(the app never sees a card credential). Remove it." >&2
+      exit 2
+    fi
+  done
+}
+
+# Builds the JSON env object shimpz-driver receives for this deploy (only keys it allowlists:
+# DATABASE_URL/SECRET_KEY/SHIMPZ_BUS_BROKERS/SHIMPZ_BUS_SASL_* — PORT/HOST are added by the driver
+# itself). Pulled straight from the project's own .env, which already travels with its read-only
+# source mount — this is a defense-in-depth duplicate so the driver can independently
+# validate DATABASE_URL/SHIMPZ_BUS_SASL_USERNAME server-side.
+_deploy_envjson(){  # $1=dir $2=root
+  local dir="$1" root="$2" envf="" k v jqargs=() jqexpr="{" first=1
+  for envf in "$dir/.env" "$root/.env"; do [ -s "$envf" ] && break; envf=""; done  # -s: see _deploy_dsngate's note
+  [ -n "$envf" ] || { echo "{}"; return 0; }
+  for k in DATABASE_URL SECRET_KEY SHIMPZ_BUS_BROKERS SHIMPZ_BUS_SASL_USERNAME SHIMPZ_BUS_SASL_PASSWORD SHIMPZ_BUS_SASL_MECHANISM; do
+    v=$(sed -n "s/^${k}=//p" "$envf" | head -1)
+    v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+    [ -n "$v" ] || continue
+    jqargs+=(--arg "$k" "$v")
+    if [ "$first" = 1 ]; then jqexpr="${jqexpr}\"$k\":\$$k"; first=0
+    else jqexpr="${jqexpr},\"$k\":\$$k"; fi
+  done
+  jqexpr="${jqexpr}}"
+  if [ "${#jqargs[@]}" -eq 0 ]; then echo "{}"; else jq -n "${jqargs[@]}" "$jqexpr"; fi
+}
+
+# PRE-LIVE STANDARDS GATE: the deterministic ecosystem rules (shimpz-stdcheck) must hold BEFORE code is
+# deployed — the Stop-hook gate only fires at end of turn, i.e. potentially AFTER this deploy already
+# served traffic. Blocks (rc 2) abort; a tool hiccup fails OPEN, surfaced (same contract as the gate).
+_deploy_stdcheck(){  # $1=project root
+  command -v shimpz-stdcheck >/dev/null 2>&1 || return 0
+  local root="$1"
+  echo "▶ ecosystem-standard check of $root (pre-live) …"
+  local out rc; set +e; out=$(shimpz-stdcheck "$root"); rc=$?; set -e
+  case "$rc" in
+    0) echo "  standards: clean" ;;
+    2) echo "$out" >&2
+       echo "  deploy ABORTED — hard standard violations above would go LIVE; fix them and re-deploy" >&2
+       exit 1 ;;
+    *) echo "  stdcheck could not run (rc=$rc) — proceeding (surfaced, fail-open)" >&2
+       _owner_note "⚠️ deploy gate degraded: stdcheck could not run (rc=$rc) for $root — deployed WITHOUT the standards check" ;;
+  esac
+}
+
+# POST-DEPLOY SMOKE GATE: a running container that can't answer, or 5xxs, is NOT deployed — it's a
+# broken process being babysat. Mirrors the old direct-curl `_smoke` EXACTLY (same probe order / same
+# 404-means-alive / 5xx-or-000-means-not-yet semantics) but goes through shimpz-driver's /health
+# endpoint (a `docker exec` INSIDE the app's own netns) since `shimpz-brain` is no longer on the app's network
+# at all. ~15s of retries then FAILS the deploy loudly with the log tail (fetched via /logs — the
+# container stays up, autorestart, so the agent can inspect+fix).
+_smoke(){  # $1=name
+  local resp healthy code
+  for _ in $(seq 1 10); do
+    if resp=$(_driver_health "$1" 2>/dev/null); then
+      healthy=$(printf '%s' "$resp" | jq -r '.healthy // false')
+      code=$(printf '%s' "$resp" | jq -r '.code // "?"')
+      [ "$healthy" = true ] && { echo "  smoke: up (HTTP $code)"; return 0; }
+    fi
+    sleep 1.5
+  done
+  echo "✗ smoke FAILED: app_$1 did not answer healthy after deploy. Log tail:" >&2
+  _driver_logs "$1" 25 2>/dev/null | jq -r '.logs // empty' >&2 || true
+  echo "  fix the app (or its .env/DB) and re-deploy; a deploy is DONE only when it answers." >&2
+  echo "  (a pure bus worker with no HTTP surface must be deployed with: shimpz-app deploy --worker …)" >&2
+  exit 1
+}
+
+# The WORKER smoke: a pure consumer promises no HTTP, so its health is "the container stays RUNNING
+# past startup" — a crashing worker lands in a non-running state and FAILS the deploy loudly.
+_worker_smoke(){  # $1=name
+  local st
+  for _ in $(seq 1 8); do
+    st=$(_driver_status "$1" 2>/dev/null | jq -r '.state.Status // "unknown"') || st="unknown"
+    [ "$st" = running ] && { echo "  smoke: worker RUNNING (no HTTP surface by contract)"; return 0; }
+    sleep 1
+  done
+  echo "✗ smoke FAILED: worker 'app_$1' is ${st:-unknown} (not running) after deploy. Log tail:" >&2
+  _driver_logs "$1" 25 2>/dev/null | jq -r '.logs // empty' >&2 || true
+  echo "  fix the worker and re-deploy; a deploy is DONE only when the container holds." >&2
+  exit 1
+}
+
+# Deploy-time service registration (R112): the app runs in its OWN container where the service
+# registry is mounted READ-ONLY (shimpzbus discover/call reads) — the WRITE happens here, on the
+# brain, right after the app proves healthy. A project opts in by shipping app/register.py or
+# register.py (shimpz-new scaffolds the former). Failure is LOUD and fails the deploy command: the
+# app IS live, but the discovery promise about it is not — fix register.py and re-deploy.
+_deploy_register(){  # $1=role dir  $2=app name  $3=port
+  local mod
+  if [ -f "$1/app/register.py" ]; then mod="app.register"
+  elif [ -f "$1/register.py" ]; then mod="register"
+  else return 0; fi
+  echo "▶ registering $2 in the service registry (deploy-time, trusted plane) …"
+  if (cd "$1" && uv run --project "$1" python -m "$mod" "$2" "$3"); then
+    echo "  registered: $2"
+  else
+    echo "✗ registration FAILED for $2 — the app is live but NOT discoverable; fix $mod and re-deploy." >&2
+    exit 1
+  fi
+}
+
+# [provides].skill — install the agent-facing skill the app SHIPS into the brain's skills dir, so the
+# agent orchestrates the app's named operations (via shimpzbus.call) instead of ad-hoc code. Copies ONLY the
+# SKILL.md (+ an optional sibling references/), NEVER the whole project dir. Picked up on the NEXT task
+# turn (each task is a fresh `claude -p` — no restart). Removed on `shimpz-app rm`. The manifest already
+# validated the path (project-relative, no traversal).
+# A skill an app ships (`[provides].skill`) is copied into the brain's OWN skills dir, where the agent
+# reads and FOLLOWS it — so a hostile skill is prompt-injection by installation. Gate it through an
+# independent read-only Opus auditor (shimpz-skillaudit) BEFORE it's trusted. Fail-CLOSED: a non-SAFE verdict
+# or a could-not-audit condition means the skill is NOT installed and the deploy stops loud (the app's
+# code already passed its own gates; this refusal is specifically about trusting the skill into the brain).
+# SHIMPZ_SKILLAUDIT=0 is the owner's explicit, surfaced escape hatch (also honored inside shimpz-skillaudit).
+_skill_audit(){  # $1=app  $2=skill source dir
+  if [ "${SHIMPZ_SKILLAUDIT:-}" = "0" ]; then
+    echo "  ↳ SHIMPZ_SKILLAUDIT=0 — installing '$1' skill WITHOUT the skill-trust audit" >&2
+    return 0
+  fi
+  command -v shimpz-skillaudit >/dev/null 2>&1 || {
+    echo "shimpz-app: shimpz-skillaudit not found — refusing to trust an UNAUDITED skill into the brain (set SHIMPZ_SKILLAUDIT=0 to override)" >&2
+    exit 1
+  }
+  shimpz-skillaudit "$2" --app "$1" || {
+    echo "shimpz-app: skill-trust audit did NOT pass for '$1' — the skill was NOT installed into the brain (verdict above); fix the skill or, if you trust it, SHIMPZ_SKILLAUDIT=0 to override" >&2
+    exit 1
+  }
+}
+
+_deploy_skill(){  # $1=project dir  $2=app name  $3=provides_skill (relative, e.g. "shimpz/SKILL.md")
+  local proj="$1" app="$2" rel="$3"
+  [ -n "$rel" ] && [ "$rel" != "null" ] || return 0     # app ships no skill
+  local src_md="$proj/$rel" dest="${SHIMPZ_SKILLS_DIR:-/config/.claude/skills}/$app"
+  if [ ! -f "$src_md" ]; then
+    echo "shimpz-app: [provides].skill declares '$rel' but $src_md is missing — ship the SKILL.md or drop the declaration" >&2
+    exit 1
+  fi
+  _skill_audit "$app" "$(dirname "$src_md")"     # gate the skill BEFORE it becomes the brain's instructions
+  rm -rf "$dest"; mkdir -p "$dest"
+  cp -a "$src_md" "$dest/SKILL.md"
+  [ -d "$(dirname "$src_md")/references" ] && cp -a "$(dirname "$src_md")/references" "$dest/references"
+  echo "  ↳ installed app skill → ~/.claude/skills/$app (the agent orchestrates $app from the next turn)"
+}
+
+# [grants].consume — enforce the app's declared cross-project READ grants (R131): a narrow, audited
+# Redpanda ACL letting <app> CONSUME a FOREIGN topic (its async twin is --calls). Idempotent (shimpz-bus
+# grant is). The manifest accepts ONLY enforced grants, so there is no declared-but-unenforced (false-
+# security) gap. A grant that can't apply (e.g. the foreign project isn't up) is a LOUD warning, not a
+# deploy-abort — the app itself is fine; the grant is a separate, fixable concern.
+_deploy_grants(){  # $1=app name  $2.. = declared consume topics
+  local app="$1"; shift
+  for topic in "$@"; do
+    [ -n "$topic" ] && [ "$topic" != "null" ] || continue
+    if shimpz-bus grant "$app" "$topic" >/dev/null 2>&1; then
+      echo "  ↳ grant: $app may CONSUME '$topic' (enforced Redpanda ACL)"
+    else
+      echo "  ⚠ grant FAILED: $app → '$topic' — app is up but can't consume it yet (is that project deployed?); fix: shimpz-bus grant $app $topic" >&2
+    fi
+  done
+}
+
+# LOGGING gate (item: observability). After security, judge whether the backend is DEBUGGABLE from its
+# structured logs (shimpz-logaudit, read-only). Contract differs from the security gate ON PURPOSE: a missing
+# log is a FIX, not a decision for Juliano — so findings (rc 2) ABORT the deploy printing the exact log
+# calls to add, and the agent auto-corrects + re-deploys (no shimpz-approve). ANY other outcome fails OPEN
+# (warn + proceed): a logging-audit hiccup must never block a deploy (it is not a security boundary).
+# Honors SHIMPZ_LOGAUDIT=0 (kill-switch, inside shimpz-logaudit). set +e: rc 2 is expected, not fatal under set -e.
+_deploy_logaudit(){  # $1=dir $2=name
+  _haspy "$1" || return 0                     # no .py → no PYTHON logging standard to judge (the
+                                              # security judge above is polyglot; this one is not)
+  command -v shimpz-logaudit >/dev/null 2>&1 || return 0   # tool absent (older image) → skip, don't wedge
+  echo "▶ code audit of $1 (deploy) …"
+  local out rc; set +e; out=$(shimpz-logaudit "$1"); rc=$?; set -e
+  case "$rc" in
+    0) echo "  code audit: clean" ;;
+    2) echo "$out" >&2
+       echo "  deploy ABORTED by the code-standards gate — apply the fixes above, then re-deploy (auto-fixable, no approval needed; SHIMPZ_LOGAUDIT=0 to skip)" >&2
+       exit 1 ;;
+    *) echo "  code audit did not certify (rc=$rc) — proceeding (fail-open):" >&2; echo "$out" >&2
+       _owner_note "⚠️ deploy gate degraded: logging audit could not certify '$2' (rc=$rc) — deployed WITHOUT it" ;;
+  esac
+}
+
+# DEPENDENCY GATE (R90): vulnerable deps used to be caught only at PUBLISH — an app that stays
+# local-only (behind Access, or a worker) ran on vulnerable pins forever. Same contract as the
+# publish-side gate: shimpz-depaudit reports ONLY fixable security vulns (exit 3 → ABORT printing the
+# exact upgrade; the agent bumps and re-deploys); any other outcome fails OPEN, surfaced. The
+# kill-switch (SHIMPZ_DEPAUDIT=0) and owner notification live inside shimpz-depaudit itself.
+_deploy_depaudit(){  # $1=project root
+  command -v shimpz-depaudit >/dev/null 2>&1 || return 0   # tool absent (older image) → skip, don't wedge
+  local root="$1"
+  echo "▶ dependency audit of $root (deploy) …"
+  local out rc; set +e; out=$(shimpz-depaudit "$root"); rc=$?; set -e
+  case "$rc" in
+    # `[ -n "$out" ] && echo ...` as a bare case-branch statement is a `set -e` landmine: when
+    # $out is empty the `&&`-chain itself evaluates to 1, and — unlike inside an if/while
+    # condition — a non-zero STATEMENT under `set -e` kills the whole script, turning "nothing to
+    # print" into a silent, unexplained deploy abort. An explicit `if` avoids that entirely.
+    0) if [ -n "$out" ]; then echo "$out" | sed 's/^/  /'; fi ;;
+    3) echo "$out" | sed 's/^/  /' >&2
+       echo "  deploy ABORTED — fixable security vulns in dependencies; apply the upgrades above and re-deploy (SHIMPZ_DEPAUDIT=0 to skip)" >&2
+       exit 1 ;;
+    *) echo "  dependency audit could not run (rc=$rc) — proceeding (surfaced, fail-open)" >&2
+       if [ -n "$out" ]; then echo "$out" | sed 's/^/  /' >&2; fi
+       _owner_note "⚠️ deploy gate degraded: dependency audit could not run (rc=$rc) for $root — deployed WITHOUT it" ;;
+  esac
+}
+
+# `shimpz-app install <app>` — deploy an app + its whole dependency tree in ONE command (the package-manager
+# front door; `shimpz-app deploy` stays the per-service primitive). Deps come from the manifest resolver
+# (deepest-first), and each app deploys via its OWN [[run]] steps (validated by the manifest + re-checked
+# by deploy). Only workspace apps (isolated containers) are ever touched — never the brain/gateway/DNS. An
+# app that declares no [[run]], or a dependency whose repo isn't in the workspace, stops with a clear
+# message so nothing is left half-installed.
+_install_one(){  # $1=projects root  $2=app name
+  local proot="$1" app="$2"; local pdir="$proot/$app"
+  [ -f "$pdir/shimpz.app.toml" ] || { echo "shimpz-app: dependency '$app' has no manifest at $pdir — add its repo to the workspace, then retry" >&2; exit 3; }
+  local run; run=$(shimpz-manifest show "$pdir" | jq -c '.run // []')
+  [ "$run" != "[]" ] && [ "$run" != "null" ] || { echo "shimpz-app: '$app' declares no [[run]] steps — can't auto-deploy it (add [[run]] to its shimpz.app.toml, or deploy it manually)" >&2; exit 3; }
+  local n i=0; n=$(printf '%s' "$run" | jq 'length')
+  while [ "$i" -lt "$n" ]; do
+    local sname sport scmd; sname=$(printf '%s' "$run" | jq -r ".[$i].name"); sport=$(printf '%s' "$run" | jq -r ".[$i].port")
+    mapfile -t scmd < <(printf '%s' "$run" | jq -r ".[$i].command[]")
+    echo "▶ install: $app → deploying service '$sname' (:$sport)"
+    shimpz-app deploy "$sname" "$sport" -- "${scmd[@]}"
+    i=$((i + 1))
+  done
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  install)
+    name="${1:?usage: shimpz-app install <app>}"; _valid_name "$name"
+    proot="${SHIMPZ_PROJECTS_DIR:-/config/workspace/projects}"
+    [ -f "$proot/$name/shimpz.app.toml" ] || { echo "shimpz-app: '$name' has no shimpz.app.toml at $proot/$name (scaffold it: shimpz-new $name)" >&2; exit 2; }
+    plan=$(shimpz-manifest plan "$proot/$name") || { echo "shimpz-app: '$name' did not resolve (see above)" >&2; exit 2; }
+    order=$(printf '%s' "$plan" | jq -r '.install_order[]?')
+    [ -n "$order" ] && echo "shimpz-app install: '$name' pulls in (dependency order): $(printf '%s' "$order" | tr '\n' ' ')"
+    for app in $order "$name"; do _install_one "$proot" "$app"; done
+    echo "✓ installed '$name'$([ -n "$order" ] && echo " + its dependency tree")" ;;
+  deploy)
+    worker=0; persist=0; calls=""; egress=""
+    while :; do
+      case "${1:-}" in
+        --worker) worker=1; shift ;;
+        --persist) persist=1; shift ;;
+        # Declared shimpzbus.call targets (comma-separated app names). The driver wires each
+        # provider into THIS app's network — an UNDECLARED cross-service call fails DNS by
+        # design (per-app isolation is the default, reach is opt-in and auditable).
+        --calls) calls="${2:?--calls needs a comma-separated list of app names}"; shift 2 ;;
+        *) break ;;
+      esac
+    done
+    name="${1:?usage: shimpz-app deploy [--worker] [--persist] [--calls a,b] <name> <port> -- <command...>}"; port="${2:?need <port>}"; shift 2
+    [ "${1:-}" = "--" ] && shift
+    [ -n "${1:-}" ] || { echo "missing command after --" >&2; exit 2; }
+    _valid_name "$name"
+    case "$port" in ''|*[!0-9]*) echo "port must be numeric" >&2; exit 2;; esac
+    # App ports are 3100–3999 by contract (Caddy/publish/tooling assume it). This was prose-only and
+    # drifted (an app shipped on 44755) — now it's refused at the source.
+    if [ "$port" -lt 3100 ] || [ "$port" -gt 3999 ]; then
+      echo "shimpz-app: port $port outside the app range 3100-3999" >&2; exit 2
+    fi
+    run="$*"
+    # SECURITY: a newline in the command would be interpolated somewhere downstream — refuse (the
+    # driver's own entrypoint validation also rejects control characters, defense in depth).
+    case "$run" in *[$'\n\r']*) echo "command must be a single line (no newlines)" >&2; exit 2;; esac
+    # The project's .env is the ONLY source of the DSN. A DATABASE_URL baked into the deploy command
+    # is invisible config that outlives renames/DB-recreates — the exact drift that pointed laudoctor
+    # at a dropped DB and 500'd every lead while /health stayed green. Refuse the whole class.
+    case "$run" in *DATABASE_URL=*)
+      echo "shimpz-app: do NOT inject DATABASE_URL in the deploy command — the project's .env is the single source" >&2; exit 2;; esac
+    proot="${SHIMPZ_PROJECTS_DIR:-/config/workspace/projects}"   # overridable, matches shimpz-new/shimpz-stdgate
+    # Resolve the app's dir from its NAME via the project naming convention (matches
+    # drivers/apps/validate.py's resolve_run_dir exactly — the two must agree): a bare name
+    # ("laudoctor") is the project's WEB tier, run from the project root; a "<project>-backend" or
+    # "<project>-ws" name is a role-specific process of that SAME project, run from
+    # <project>/backend (the ws gateway also lives under backend/, per CLAUDE.md's app/ws.py
+    # convention). NEVER guessed from which subdirs happen to exist — a bare-named web app's
+    # project root routinely ALSO has its own backend/ subdir (confirmed against the real live
+    # `laudoctor` + `laudoctor-backend` apps, which share one project dir exactly this way), so
+    # "does backend/ exist" is not a safe signal for what a bare name means. (Redeploys no longer
+    # reuse a stored supervisor conf's directory= — this convention resolves the SAME path every
+    # time from the workspace volume, so there is nothing stateful to drift here.)
+    project="$name"; role=""
+    case "$name" in *-backend) project="${name%-backend}"; role=backend ;; *-ws) project="${name%-ws}"; role=backend ;; esac
+    proj_dir="$proot/$project"
+    if [ -n "$role" ]; then
+      dir="$proj_dir/$role"
+      [ -d "$dir" ] || { echo "shimpz-app: unknown app '$name' — no $role/ dir at $dir (scaffold the project first: shimpz-new $project)" >&2; exit 2; }
+    else
+      [ -d "$proj_dir" ] || { echo "shimpz-app: unknown app '$name' — no project at $proj_dir (scaffold it first: shimpz-new $name)" >&2; exit 2; }
+      dir="$proj_dir"
+    fi
+    # ── manifest pre-flight (the shimpz.app.toml app standard) ─────────────────────────────────────────
+    # If the project ships a shimpz.app.toml, its [needs] declares app→app dependencies that must already
+    # be up, native integrations it requires, and service APIs it reuses. Resolve it against the LIVE
+    # workspace + registry (shimpz-manifest) BEFORE the gates, so a missing dependency fails fast + cheap.
+    if [ -f "$proj_dir/shimpz.app.toml" ]; then
+      plan=$(shimpz-manifest plan "$proj_dir") || { echo "shimpz-app: $proj_dir/shimpz.app.toml did not resolve (see above)" >&2; exit 2; }
+      # app→app: every required app must be deployed first, dependency-order (REUSE, don't duplicate).
+      if [ -n "$(printf '%s' "$plan" | jq -r '.install_order[]?')" ]; then
+        echo "shimpz-app: '$name' depends on apps that aren't deployed yet — install these first, in order:" >&2
+        printf '%s' "$plan" | jq -r '.install_order[] | "  - shimpz-app deploy " + . + " …"' >&2
+        echo "  (reuse the shared app, never a second copy). Then retry." >&2
+        exit 3
+      fi
+      # service calls the manifest declares → merge into --calls (declared sync reach, R128).
+      mcalls=$(printf '%s' "$plan" | jq -r '.calls | join(",")')
+      [ -n "$mcalls" ] && calls="${calls:+$calls,}$mcalls" && echo "  ↳ manifest calls: $mcalls" >&2
+      # external egress the app declares ([needs].egress) + pay.shimpz.com if paid → effective_egress (L2).
+      megress=$(printf '%s' "$plan" | jq -r '.egress_allow | join(",")')
+      [ -n "$megress" ] && egress="$megress" && echo "  ↳ manifest egress: $megress" >&2
+      # native integrations the app requires → surfaced now (the driver hard-gate is the next slice).
+      reqnative=$(printf '%s' "$plan" | jq -r '.native | join(", ")')
+      [ -n "$reqnative" ] && echo "  ℹ '$name' requires native integrations enabled: $reqnative (enable them in the admin panel)" >&2
+    fi
+    root=$(_projroot "$dir")                        # project root, computed ONCE for the root-scanning gates
+    _deploy_stdcheck "$root"                        # deterministic standards BEFORE anything goes live
+    _deploy_dsngate "$dir" "$root"                  # affirmative DB isolation: .env DSN must be THIS project's proj_<name> (R90)
+    _deploy_secretgate "$dir" "$root"                # .env must never declare a global agent secret (SECURITY_ENGINEERING_PLAN.md 3)
+    _deploy_paygate "$dir" "$root"                   # .env must never carry a payment-processor key — payment is locked to ShimpzPay
+    _deploy_secgate "$dir" "$name" "$port" "$run"   # security audit BEFORE supervising; deny aborts (nothing runs)
+    _deploy_logaudit "$dir" "$name"                 # logging/observability audit; findings abort w/ fixes (auto-correct)
+    _deploy_depaudit "$root"                        # fixable dep vulns abort with the exact upgrade (R90)
+    envjson=$(_deploy_envjson "$dir" "$root")
+    echo "▶ deploying $name via shimpz-driver …"
+    _driver_deploy "$name" "$port" "$persist" "$worker" "$envjson" "$calls" "$egress" -- "$@" >/dev/null
+    echo "  container app_$name created (persist=$([ "$persist" = 1 ] && echo yes || echo no))"
+    # A deploy is DONE only when the app proves itself: HTTP answer for a web app (dead DSN/bad boot
+    # fails here), sustained running for a --worker (a pure consumer binds no port by contract).
+    if [ "$worker" -eq 1 ]; then _worker_smoke "$name"; else _smoke "$name"; fi
+    _deploy_register "$dir" "$name" "$port"
+    _deploy_skill "$proj_dir" "$name" "$(printf '%s' "${plan:-}" | jq -r '.provides_skill // ""' 2>/dev/null || echo "")"
+    # shellcheck disable=SC2046  # intentional word-split: each consume topic (validated, no spaces) is its own arg
+    _deploy_grants "$name" $(printf '%s' "${plan:-}" | jq -r '.grants_consume[]? // empty' 2>/dev/null || true)
+    echo "→ app '$name' running in container app_$name  (logs: shimpz-app logs $name)"
+    # An INTERNAL service (registry internal=true) must never be suggested for publishing — the
+    # shimpz-publish exposure gate refuses it anyway; point at the consumption path instead.
+    if jq -e '.internal == true' "${SHIMPZ_REGISTRY:-/config/workspace/registry}/$name.json" >/dev/null 2>&1; then
+      echo "  internal service: consumers declare it with \`shimpz-app deploy --calls $name ...\` and use shimpzbus.call/topics — shimpz-publish is refused by design"
+    else
+      echo "  next: shimpz-publish <fqdn> $port [public|private]   (tunnel + DNS + route + Access in one shot)"
+    fi ;;
+  list)
+    echo "shimpz-app: per-app status/logs: shimpz-app status|logs <name>. Raw container list:" >&2
+    docker_list_hint="docker ps --filter label=shimpz.driver=1"
+    echo "  (run '$docker_list_hint' on the host, or ask shimpz-driver directly — 'shimpz-brain' has no" \
+         "Docker access by design, so this CLI can't enumerate every app container itself)" >&2 ;;
+  status) _valid_name "${1:?need <name>}"; _driver_status "$1" | jq . ;;
+  restart) _valid_name "${1:?need <name>}"; _driver_lifecycle "$1" restart >/dev/null && echo "restarted $1" ;;
+  start)   _valid_name "${1:?need <name>}"; _driver_lifecycle "$1" start   >/dev/null && echo "started $1" ;;
+  stop)    _valid_name "${1:?need <name>}"; _driver_lifecycle "$1" stop    >/dev/null && echo "stopped $1" ;;
+  logs)    _valid_name "${1:?need <name>}"; _driver_logs "$1" "${2:-80}" | jq -r '.logs // empty' ;;
+  rm)
+    name="${1:?need <name>}"; _valid_name "$name"
+    purge=0; [ "${2:-}" = "--purge" ] && purge=1
+    _driver_rm "$name" "$purge" >/dev/null
+    rm -rf "${SHIMPZ_SKILLS_DIR:-/config/.claude/skills}/$name"   # remove the app's agent-facing skill ([provides]) — no-op if none
+    echo "removed app '$name'$([ "$purge" = 1 ] && echo " (and its /data volume)") (the domain, if any, is separate: shimpz-unpublish <fqdn>)" ;;
+  *) echo "usage: shimpz-app deploy|list|status|restart|start|stop|logs|rm ..." >&2; exit 2 ;;
+esac

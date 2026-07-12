@@ -1,0 +1,1637 @@
+#!/opt/venv/bin/python
+"""Shimpz gateway — a Telegram bot (voice + text + buttons) whose brain is Claude Code.
+
+  Telegram  ──(voice)──►  OpenAI STT ─┐
+            ──(text)──────────────────┼─►  `claude -p` (acting: Bash + toolbelt + Chrome/CDP + shimpz-input vision)
+                                       │        │
+            ◄── text  ◄────────────────┘        ▼  reply
+            ◄── voice note (OpenAI TTS, when you spoke)
+
+Interactive layer:
+  • /menu, /desktop, /reset commands + a command menu.
+  • Inline buttons for the menu and for APPROVALS / CAPTCHA handoff.
+  • IPC bridge: the brain calls `shimpz-approve`/`shimpz-captcha`, which drop a request file in
+    $SHIMPZ_HOME/ipc; this gateway watches it, sends inline buttons, and writes back your choice.
+
+Single-user: only TELEGRAM_ALLOWED_USERS may talk to it. Per-chat Claude sessions persist
+(via --resume). Launched + supervised by the desktop autostart.
+"""
+
+import asyncio
+import html
+import io
+import json
+import logging
+import os
+import re
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, "/opt/shimpz-lib")
+import shimpzchat  # Phase D1: the brain-run core (session continuity, checkpoint/rotate, run/stop) — re-exported below
+import shimpzenv
+import shimpzipc  # the SHARED $SHIMPZ_HOME/ipc protocol: pending()/answer()/mark_sent() + atomic_write
+import shimpzopenai  # the SHARED openai-driver client — voice (STT/TTS) runs through the sidecar now
+import shimpzprompt  # the shared brain-invocation constants + protocols (also imported by shimpz-run — one source)
+
+# WORKDIR/the system prompts appended on every run are OWNED by shimpz-lib/shimpzprompt (declared single
+# source, TESTS.md R79) — aliased here, never redefined. The gateway still uses WORKDIR for
+# INCOMING_DIR + the /menu file listing.
+WORKDIR = shimpzprompt.WORKDIR
+
+# Phase D1 re-exports: shimpzchat.py OWNS the run core (driven by a conversation_id + a shimpzchan.Sink +
+# a resolved lang). Alias its state + helpers into this gateway namespace so the gateway's own code
+# AND the 363-check characterization suite keep resolving them via `gw.X` (shared/immutable objects,
+# safe to alias — SESSIONS/RUN_PROCS/CANCELLED are the SAME live objects shimpzchat mutates).
+SESSIONS = shimpzchat.SESSIONS
+RUN_PROCS = shimpzchat.RUN_PROCS  # live brain Process per conversation (the Stop button kills it)
+CANCELLED = shimpzchat.CANCELLED  # conversations the user just Stopped (not a crash)
+SESS_FILE = shimpzchat.SESS_FILE
+MEMORY_DIR = shimpzchat.MEMORY_DIR
+MEMORY_PROTOCOL = shimpzchat.MEMORY_PROTOCOL
+SHIMPZ_CTX_MAX_BYTES = shimpzchat.SHIMPZ_CTX_MAX_BYTES  # shown in the /status card
+SHIMPZ_THINKING_TOKENS = shimpzchat.SHIMPZ_THINKING_TOKENS
+CHECKPOINT_PROMPT = shimpzchat.CHECKPOINT_PROMPT
+MSG_MAX = shimpzchat.MSG_MAX  # Telegram single-message ceiling (LiveCard/_finish/TelegramSink apply it)
+_load_sessions = shimpzchat._load_sessions
+_save_sessions = shimpzchat._save_sessions
+_remember_session = shimpzchat._remember_session
+_session_bytes = shimpzchat._session_bytes
+_load_recent = shimpzchat._load_recent
+_save_recent = shimpzchat._save_recent
+_recent_path = shimpzchat._recent_path
+_is_mem_sentinel = shimpzchat._is_mem_sentinel
+_kill_tree = shimpzchat._kill_tree
+_interrupted = shimpzchat._interrupted
+_no_output_message = shimpzchat._no_output_message
+_checkpoint_summary = shimpzchat._checkpoint_summary
+_prepare_brain_run = shimpzchat._prepare_brain_run
+_consume_event = shimpzchat._consume_event
+_relay_stream = shimpzchat._relay_stream
+
+SHIMPZ_HOME = os.environ.get("SHIMPZ_HOME", "/config/.shimpz")
+IPC_DIR = Path(SHIMPZ_HOME) / "ipc"
+LOGIN_DIR = Path(SHIMPZ_HOME) / "login"  # shimpz-login bridge IPC (url/code/result/await)
+SHIMPZ_LOGIN = "/usr/local/bin/shimpz-login"
+LOGIN_URL_TRIES = 70  # url-poll budget (~21s at LOGIN_POLL_S); overridable in tests
+LOGIN_RESULT_TRIES = 100  # result-poll budget (~30s)
+LOGIN_POLL_S = 0.3
+# --- Memory model: CONTINUITY-PER-CONVERSATION (short-term in session, long-term on disk) --
+# A conversation keeps ONE session (--resume, checkpoint-and-rotate past SHIMPZ_CTX_MAX_BYTES) so a long
+# task never drags a multi-MB transcript AND never loses its thread — that whole run-core lives in
+# shimpzchat.py now (SESSIONS/_prepare_brain_run/_checkpoint_summary, re-exported above). Long-term
+# cross-task learnings live in the memory store: shimpz-recall injects them ONLY on a fresh session.
+INCOMING_DIR = Path(WORKDIR) / "incoming"  # images Juliano sends land here so the brain can Read them
+# /clear sweep depth: how many message ids below the /clear message we try to bulk-delete.
+# Telegram only lets bots delete messages younger than 48h, so a bounded sweep loses nothing —
+# anything past the window is undeletable regardless of how far we walk.
+SHIMPZ_CLEAR_SWEEP = int(os.environ.get("SHIMPZ_CLEAR_SWEEP", "2000"))
+TTS_MAX = 4000
+DESKTOP_URL = os.environ.get("SHIMPZ_DESKTOP_URL", "https://agents.zyon.network")
+
+# NOTE: the PROJECT GOLDEN PATH (the non-negotiable stack rules) lives ONLY in the workspace CLAUDE.md,
+# which Claude Code auto-loads from WORKDIR on every `claude -p` run. It used to be DUPLICATED here as
+# ENV_CONVENTIONS and appended via --append-system-prompt — paying ~1.5k tokens twice per run and
+# letting the two copies drift. Single source of truth = CLAUDE.md; this file now carries only the
+# RUNTIME-only protocol (memory) that CLAUDE.md can't cover as a static file.
+
+
+shimpzenv.load(SHIMPZ_HOME)  # single source of truth for $SHIMPZ_HOME/.env (see /opt/shimpz-lib/shimpzenv.py)
+
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+ALLOWED = {
+    int(x) for x in os.environ.get("TELEGRAM_ALLOWED_USERS", "").replace(" ", "").split(",") if x.strip().isdigit()
+}
+OWNER = next(iter(ALLOWED), None)
+# LANG_PREF/SPEAK_PREF/etc are all keyed by the STRING chat_id (str(update.effective_chat.id)) — OWNER
+# itself is an int (from ALLOWED). Keep a string form so passing chat_id=OWNER_CID into _t()/_lang_for()
+# actually matches the key OWNER's own /lang tap would have written (an int/str key mismatch would
+# silently miss OWNER's preference and fall back to SHIMPZ_UI_LANG every time — a real, silent bug).
+OWNER_CID = str(OWNER)
+# SECURITY_ENGINEERING_PLAN.md item 7: the gateway no longer holds the OpenAI key. Voice availability
+# is now "is the openai-driver sidecar wired?" (its token readable) instead of "is OPENAI_KEY set".
+STT_MODEL = "gpt-4o-transcribe"
+TTS_MODEL = "gpt-4o-mini-tts"
+TTS_VOICE = "onyx"
+
+# --- pt/en language switch for the static UI strings a human reads (buttons, cards, status ticker,
+# error notices) — mirrors scripts/battle-test-gate.py's BATTLE_GATE_LANG. English is the untouched
+# coded default (every _UI_EN value below is byte-identical to what shipped before this switch existed,
+# so SHIMPZ_UI_LANG unset changes nothing observable); Portuguese is additive. Shimpz's own free-form
+# conversational replies already mirror Juliano's language dynamically (CLAUDE.md/shimpzprompt.py) — this
+# is a SEPARATE, narrower switch for the fixed strings the CODE authors, not the LLM.
+# EXCEPTION: the /login flow (login_*) was ALREADY hardcoded in Portuguese before this switch existed —
+# an inconsistency in an otherwise-English file. For those keys ONLY, _UI_PT is the existing/unchanged
+# text (verbatim) and _UI_EN is newly authored (a natural translation) — the one place SHIMPZ_UI_LANG
+# unset legitimately changes observable behavior (PT → EN), by explicit owner directive.
+#
+# R99: SHIMPZ_UI_LANG is the process-wide DEFAULT, set once at container boot. On top of it, a chat can
+# flip its OWN language live with /lang (LANG_PREF: chat_id -> "pt"/"en"; R106: persisted in
+# $SHIMPZ_HOME/prefs.json and seeded from Telegram's user.language_code — see _seed_lang). _t() takes an
+# optional chat_id: given one, the chat's own LANG_PREF choice wins, falling back to SHIMPZ_UI_LANG when
+# that chat never chose; omitted, _t() uses the global SHIMPZ_UI_LANG only — for call sites with no chat
+# in scope. The `/` command menu is layered separately (_bot_commands/_set_chat_commands): a global
+# SHIMPZ_UI_LANG default + per-client-locale variants + a BotCommandScopeChat pin per explicit choice.
+SHIMPZ_UI_LANG = os.environ.get("SHIMPZ_UI_LANG", "en")
+
+import shimpzi18n
+
+# The pt/en string dicts moved to the shimpzi18n leaf (Phase D1) so shimpzchat.py can render text too.
+# Re-export the aliases (immutable dicts — safe to alias) so the gateway's _bot_commands + the suite
+# keep referencing _UI_EN/_UI_PT unchanged. _t below becomes a thin wrapper over the leaf.
+_UI_EN = shimpzi18n._UI_EN
+_UI_PT = shimpzi18n._UI_PT
+
+
+def _lang_for(chat_id):
+    """The active language for ONE chat: its own /lang choice (LANG_PREF) if it ever ran /lang, else SHIMPZ_UI_LANG."""
+    return LANG_PREF.get(chat_id, SHIMPZ_UI_LANG)
+
+
+def _t(key, *args, chat_id=None):
+    """The active-language string for `key`, `.format(*args)`'d if any were given.
+
+    Pass `chat_id` to honor THAT chat's own /lang choice (falling back to SHIMPZ_UI_LANG when it never
+    ran /lang). Omitted (the default), the global SHIMPZ_UI_LANG decides — for call sites with no chat
+    in scope. (BotCommand descriptions don't use _t() at all: _bot_commands renders them per
+    explicit language for the global/per-locale/per-chat menus.)
+    """
+    lang = _lang_for(chat_id) if chat_id is not None else SHIMPZ_UI_LANG
+    return shimpzi18n.t(key, *args, lang=lang)
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+for n in ("httpx", "telegram", "telegram.ext"):
+    logging.getLogger(n).setLevel(logging.WARNING)  # keep the bot token out of the logfile
+log = logging.getLogger("shimpz-gateway")
+
+if not TOKEN:
+    log.error("TELEGRAM_BOT_TOKEN not set — gateway cannot start.")
+    sys.exit(1)  # fail-fast: non-zero = visibly down
+if not ALLOWED:
+    log.warning("TELEGRAM_ALLOWED_USERS empty — denying everyone (safe default).")
+
+import contextlib
+
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+    ReactionTypeEmoji,
+    Update,
+)
+from telegram.constants import ChatAction
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
+
+# Voice is on iff the openai-driver sidecar is reachable/wired (its token file is readable).
+# Same on/off meaning the old `_oa is not None` had, without the gateway ever holding the key.
+_voice_on = shimpzopenai.available()
+
+
+ASK_OPTS = {}  # rid -> [option strings] for shimpz-ask choice cards
+AWAITING_FREE = {}  # chat_id -> rid : next text msg is a free-text answer to that ask
+_RID_RE = re.compile(r"[0-9a-f]{12}")  # the exact shape shimpzipc mints (uuid4().hex[:12]); reject the rest
+AWAITING_LOGIN = {}  # chat_id -> 1 : next text msg is the OAuth code for an in-progress /login
+
+# --- per-chat run state -------------------------------------------------------------
+# A conversation runs ONE brain at a time. Without this, a second message sent mid-run spawns a
+# second `claude --resume` on the SAME session id → two processes writing one transcript. The lock
+# serializes runs per chat (a follow-up simply waits its turn); RUN_PROCS/CANCELLED (re-exported from
+# shimpzchat above) hold the live process for the 🛑 Stop button and mark a user-initiated stop so it
+# doesn't read as a crash; LAST_TASK backs the 🔁 Retry button; SPEAK_PREF is the per-chat voice pref.
+RUN_LOCKS = {}  # chat_id -> asyncio.Lock (created lazily, in the running loop)
+
+LAST_TASK = {}  # chat_id -> last user task string (for the Retry button)
+
+# Per-chat prefs (voice + language) PERSIST in $SHIMPZ_HOME/prefs.json (R106) — a /lang or voice-toggle
+# choice used to be in-memory only and silently reset on every gateway restart. Loaded once at import;
+# _save_prefs() rewrites the file atomically on every change.
+PREFS_FILE = Path(SHIMPZ_HOME) / "prefs.json"
+
+
+def _load_prefs():
+    # fail-fast: only a missing file means "no prefs yet"; corrupt JSON must surface (same contract
+    # as _load_sessions), never silently reset every chat's choices.
+    if not PREFS_FILE.exists():
+        return {}
+    return json.loads(PREFS_FILE.read_text())
+
+
+_prefs = _load_prefs()
+SPEAK_PREF = {c: p["voice"] for c, p in _prefs.items() if "voice" in p}  # chat_id -> "always" | "never"
+LANG_PREF = {c: p["lang"] for c, p in _prefs.items() if "lang" in p}  # chat_id -> "pt" | "en"
+del _prefs
+
+
+def _save_prefs():
+    """Persist SPEAK_PREF + LANG_PREF to prefs.json (atomic, same shape _save_sessions uses)."""
+    d = {}
+    for c, v in SPEAK_PREF.items():
+        d.setdefault(c, {})["voice"] = v
+    for c, v in LANG_PREF.items():
+        d.setdefault(c, {})["lang"] = v
+    try:
+        shimpzipc.atomic_write(PREFS_FILE, json.dumps(d))
+    except OSError as e:
+        log.warning("could not persist prefs: %s", e)
+
+
+START_MONO = time.monotonic()  # process start, for /status uptime
+# A single Telegram message can hold ~4096 chars; above this a final answer can't be edited into the
+# live card, so it overflows to a .md file (an attachment — one of the two allowed extra messages).
+MSG_MAX = int(os.environ.get("SHIMPZ_MSG_MAX_CHARS", "3800"))
+# Reaction emojis (must be from Telegram's allowed set): receipt / done / failed.
+REACT_SEEN, REACT_DONE, REACT_FAIL = "👀", "👍", "😢"
+# The Stop control shown on the live card while the brain runs.
+# The Stop control carries the RUN's identity (the live brain pid) so a stale/late/double tap — now
+# that updates dispatch concurrently — can only ever kill the run it belongs to, never a later one.
+_STOP = object()  # sentinel: LiveCard.update resolves it to the current run's Stop keyboard
+
+
+def _stop_kb(token, chat_id=None):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(_t("btn_stop", chat_id=chat_id), callback_data=f"stoprun:{token or ''}")]]
+    )
+
+
+# R99: these were module-level constants built ONCE at import (English/global SHIMPZ_UI_LANG only). Now
+# that a per-chat language exists, they must be built PER CALL so a chat that ran /lang pt actually
+# sees pt on its Retry/Continue buttons — every former bare-constant reference below now calls these.
+def _retry_kb(chat_id=None):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(_t("btn_retry", chat_id=chat_id), callback_data="retry")]])
+
+
+def _continue_kb(chat_id=None):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(_t("btn_continue", chat_id=chat_id), callback_data="cont"),
+                InlineKeyboardButton(_t("btn_halt", chat_id=chat_id), callback_data="halt"),
+            ]
+        ]
+    )
+
+
+_CMDS = ("menu", "desktop", "login", "reset", "clear", "start", "lang")  # the `/` command menu, in order
+
+
+def _bot_commands(lang):
+    """The BotCommand list rendered in ONE language ("pt"/"en") — for the global, per-locale and per-chat menus."""
+    tbl = _UI_PT if lang == "pt" else _UI_EN
+    return [BotCommand(c, tbl[f"cmd_{c}_desc"]) for c in _CMDS]
+
+
+async def _set_chat_commands(bot, cid):
+    """Pin THIS chat's `/` command menu to its active language (R106).
+
+    BotCommandScopeChat overrides the global/per-locale menus, so a /lang tap (or a locale seed)
+    actually changes the command DESCRIPTIONS the user sees — before this, the menu stayed on the
+    boot-time SHIMPZ_UI_LANG forever. Best-effort: the menu is cosmetic and must never break the
+    language switch itself.
+    """
+    with contextlib.suppress(TelegramError):
+        await bot.set_my_commands(_bot_commands(_lang_for(cid)), scope=BotCommandScopeChat(chat_id=cid))
+
+
+async def _sync_command_menus(bot):
+    """Publish the `/` command menus and PURGE stale scopes — runs at every boot (idempotent).
+
+    Layers, most specific wins: BotCommandScopeChat pins (persisted /lang choices, re-pinned last),
+    per-client-locale pt/en variants, the SHIMPZ_UI_LANG default. The deletes matter just as much:
+    command registrations live on TELEGRAM'S side until deleted, and the pre-Shimpz (Hermes) gateway
+    left its own list under all_private_chats/all_group_chats — scopes MORE specific than default,
+    so every private chat saw the dead Hermes menu shadowing ours.
+    """
+    try:
+        await bot.set_my_commands(_bot_commands(SHIMPZ_UI_LANG))
+        for lc in ("en", "pt"):
+            await bot.set_my_commands(_bot_commands(lc), language_code=lc)
+        for scope in (
+            BotCommandScopeAllPrivateChats(),
+            BotCommandScopeAllGroupChats(),
+            BotCommandScopeAllChatAdministrators(),
+        ):
+            await bot.delete_my_commands(scope=scope)
+            for lc in ("en", "pt"):
+                await bot.delete_my_commands(scope=scope, language_code=lc)
+    except TelegramError as e:
+        log.warning("command-menu sync: %s", e)
+    # Re-pin each persisted per-chat /lang choice (beats every layer above) — e.g. a pref written
+    # while the bot was offline, or before the per-chat pin feature shipped.
+    for cid in LANG_PREF:
+        await _set_chat_commands(bot, cid)
+
+
+def _lock_for(chat_id):
+    """The per-chat run lock (one brain at a time per conversation).
+
+    Lazily created so it binds to the running event loop on first use.
+    """
+    return RUN_LOCKS.setdefault(chat_id, asyncio.Lock())
+
+
+async def _react(bot, chat_id, message_id, emoji):
+    """Best-effort message reaction (instant acknowledgement / outcome marker).
+
+    Never fatal — reactions can be rejected (invalid emoji, message gone) and that must not break
+    a run.
+    """
+    with contextlib.suppress(TelegramError):
+        await bot.set_message_reaction(chat_id, message_id, reaction=[ReactionTypeEmoji(emoji)])
+
+
+def _should_speak(chat_id, spoke: bool) -> bool:
+    """Voice-reply policy: explicit per-chat pref wins, else speak only when the user sent audio."""
+    pref = SPEAK_PREF.get(chat_id)
+    if pref == "always":
+        return True
+    if pref == "never":
+        return False
+    return spoke
+
+
+async def _send_as_file(bot, chat_id, text, reply_to=None):
+    """Send `text` as a .md document — how a too-long reply is delivered (Telegram can't edit >4096 chars in).
+
+    One of the two message types that ARE allowed to be their own message (the other is a voice
+    note).
+    """
+    with contextlib.suppress(TelegramError):
+        await bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+    bio = io.BytesIO(text.encode("utf-8"))
+    bio.name = f"shimpz-reply-{time.strftime('%H%M%S')}.md"
+    await bot.send_document(
+        chat_id, document=bio, caption=_t("full_reply_caption", chat_id=chat_id), reply_to_message_id=reply_to
+    )
+
+
+class LiveCard:
+    """ONE editable message per task turn.
+
+    The status ticker, Shimpz's streamed words, and the final short answer all live HERE — edited in
+    place — instead of a flood of new messages. The 🛑 Stop control rides on it while the brain
+    runs. A final answer that doesn't fit one message overflows to a .md file (dropping the card).
+    The only outbound messages that are NOT this card, by nature: voice notes (audio) and file
+    attachments (long replies / documents).
+    """
+
+    def __init__(self, bot, chat_id, reply_to=None, mid=None):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.reply_to = reply_to
+        self.mid = mid  # None until the card is first materialized (or an adopted message id)
+        self._last = None  # last rendered text (throttle no-op repeats)
+        self.stop_token = None  # the current run's pid — stamped into the Stop button
+
+    async def update(self, text, markup=_STOP, html=False):
+        """Edit the card to `text` (create it lazily on first call).
+
+        No-op if unchanged. Best-effort: an edit/parse failure falls back to a plain edit so a live
+        update is never fatal.
+        """
+        if not text or text == self._last:
+            return
+        if markup is _STOP:  # default: the Stop control, bound to THIS run's identity
+            markup = _stop_kb(self.stop_token, self.chat_id)
+        self._last = text
+        body = _tg_html(text) if html else text
+        pm = "HTML" if html else None
+        try:
+            if self.mid is None:
+                m = await self.bot.send_message(
+                    self.chat_id,
+                    body,
+                    reply_markup=markup,
+                    parse_mode=pm,
+                    disable_web_page_preview=True,
+                    reply_to_message_id=self.reply_to,
+                )
+                self.mid = m.message_id
+            else:
+                await self.bot.edit_message_text(
+                    body,
+                    self.chat_id,
+                    self.mid,
+                    reply_markup=markup,
+                    parse_mode=pm,
+                    disable_web_page_preview=True,
+                )
+        except TelegramError:
+            with contextlib.suppress(TelegramError):
+                if self.mid is None:
+                    m = await self.bot.send_message(self.chat_id, text, reply_markup=markup)
+                    self.mid = m.message_id
+                else:
+                    await self.bot.edit_message_text(text, self.chat_id, self.mid, reply_markup=markup)
+
+    async def finalize(self, text):
+        """Deliver the final answer INTO the card (Stop button removed).
+
+        If it doesn't fit one message, send it as a .md file and drop the card (the file becomes
+        the message).
+        """
+        if not text:
+            return
+        if len(text) <= MSG_MAX:
+            self._last = None  # force the edit even if a streamed preview already equalled it
+            await self.update(text, markup=None, html=True)
+            return
+        try:
+            await _send_as_file(self.bot, self.chat_id, text, self.reply_to)
+            with contextlib.suppress(TelegramError):
+                if self.mid is not None:
+                    await self.bot.delete_message(self.chat_id, self.mid)
+                    self.mid = None
+        except TelegramError as e:
+            # no file → never lose the text: keep a truncated preview in the card
+            log.warning("send_document failed, keeping a preview in the card: %s", e)
+            self._last = None
+            await self.update(text[:MSG_MAX], markup=None, html=True)
+
+
+# --- the brain (LIVE STREAMING — punctual feedback, never radio silence) ------------
+# The run CORE (the stream-json loop, session continuity, checkpoint/rotate, run_claude/run_task,
+# the Stop handle) lives in shimpzchat.py, re-exported above. What stays HERE is the TELEGRAM rendering:
+# LiveCard is the editable message, wrapped by TelegramSink — the reference `shimpzchan.Sink` a brain
+# run renders its live progress into. TelegramSink reproduces, byte-for-byte, the card.update /
+# bot.send_message calls (and their TelegramError suppression) run_claude/_relay_stream made inline
+# before the D1 lift, so behaviour is identical.
+class TelegramSink:
+    """The reference `shimpzchan.Sink`: render a brain run's LIVE progress into ONE Telegram LiveCard.
+
+    Holds (bot, chat_id, card). Every method is best-effort — a TelegramError never escapes into the
+    run loop (LiveCard.update already swallows it internally; the direct bot.send_message here is
+    wrapped). This is the exact card behaviour shimpz-gateway drove inline before Phase D1.
+    """
+
+    def __init__(self, bot, chat_id, card):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.card = card
+
+    async def bind_run(self, pid):
+        # (re)bind the Stop button to THIS run's identity before the first card update.
+        self.card.stop_token = pid
+
+    async def thinking(self):
+        # Fresh card → instant feedback before the first tool runs (no-op once the card exists).
+        if self.card._last is None:
+            with contextlib.suppress(TelegramError):
+                await self.card.update(_t("status_thinking", chat_id=self.chat_id))
+
+    async def status(self, label):
+        with contextlib.suppress(TelegramError):
+            await self.card.update(label)
+
+    async def stream(self, text):
+        with contextlib.suppress(TelegramError):
+            await self.card.update(text[:MSG_MAX] if len(text) > MSG_MAX else text, html=True)
+
+    async def heartbeat(self, label):
+        lbl = label or _t("status_working", chat_id=self.chat_id)
+        with contextlib.suppress(TelegramError):
+            await self.card.update(_t("heartbeat_suffix", lbl, chat_id=self.chat_id))
+
+    async def start_failed(self, message):
+        with contextlib.suppress(TelegramError):
+            await self.bot.send_message(self.chat_id, message)
+
+    async def stopped(self, message):
+        with contextlib.suppress(TelegramError):
+            await self.card.update(message, markup=None)
+
+
+async def run_claude(
+    bot,
+    chat_id: str,
+    prompt: str,
+    force_continue: bool = False,
+    model: str | None = None,
+    max_turns: int | None = None,
+    *,
+    card: LiveCard,
+):
+    """Thin adapter: drive shimpzchat's brain-run core against a TelegramSink over this chat's LiveCard.
+
+    Keeps the OLD gateway signature (bot, chat_id, prompt, …, card) every caller + the
+    characterization suite use; the run logic itself lives in shimpzchat.run_claude (channel-neutral).
+    Returns (final_text, subtype).
+    """
+    return await shimpzchat.run_claude(
+        chat_id, prompt, TelegramSink(bot, chat_id, card), _lang_for(chat_id), force_continue, model, max_turns
+    )
+
+
+async def _finish(bot, chat_id, final_text, subtype, spoke, card):
+    """Post-run endings, delivered INTO the live card (no new messages).
+
+    The one exception is a voice reply — a note is its own message by nature (audio). Streamed
+    words were previewed in the card; finalize() delivers the definitive answer (or overflows a
+    long one to a .md file).
+    """
+    if subtype == "cancelled":
+        return  # card already shows '🛑 Stopped.'
+    if subtype == "error_max_turns":
+        text = final_text or _t("step_limit_msg", chat_id=chat_id)
+        await card.update(text[:MSG_MAX], markup=_continue_kb(chat_id), html=bool(final_text))
+    elif subtype == "timeout":
+        text = final_text or _t("took_too_long_msg", chat_id=chat_id)
+        await card.update(text[:MSG_MAX], markup=_retry_kb(chat_id), html=bool(final_text))
+    elif final_text:
+        await card.finalize(final_text)
+    elif subtype == "success":
+        await card.update(_t("done_msg", chat_id=chat_id), markup=None)
+    else:
+        await card.update(_t("no_result_msg", chat_id=chat_id), markup=_retry_kb(chat_id))
+    if _should_speak(chat_id, spoke) and final_text:
+        with contextlib.suppress(TelegramError):
+            await bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
+        voice = await synthesize(final_text)
+        if voice:
+            try:
+                # read off the event loop (the voice note can be a few hundred KB), then hand
+                # PTB the bytes — same upload, no blocking file I/O on the loop.
+                data = await asyncio.to_thread(Path(voice).read_bytes)
+                # TTS only covers the first TTS_MAX chars — say so instead of silently truncating.
+                cap = _t("spoken_excerpt", chat_id=chat_id) if len(final_text) > TTS_MAX else None
+                await bot.send_voice(chat_id, voice=data, caption=cap)
+            except (OSError, TelegramError) as e:
+                log.warning("send_voice failed: %s", e)
+            finally:
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(Path(voice).unlink)
+
+
+async def run_task(bot, chat_id: str, prompt: str, card=None, **kw):
+    """Thin adapter for a USER task: drive shimpzchat's auto-continue loop against this chat's LiveCard.
+
+    shimpzchat.run_task auto-continues past the per-run step cap (up to SHIMPZ_AUTO_CONTINUE times) so a
+    long job finishes unattended, then returns error_max_turns unchanged so _finish shows the manual
+    Continue/Stop card. The auto-continue notice streams through the TelegramSink so it edits the
+    same live message in place. Keeps the OLD (bot, chat_id, prompt, card) signature the callers use.
+    """
+    return await shimpzchat.run_task(chat_id, prompt, TelegramSink(bot, chat_id, card), _lang_for(chat_id), **kw)
+
+
+# --- voice -------------------------------------------------------------------------
+async def transcribe(path: str) -> str:
+    if not _voice_on:
+        return ""
+    # The blocking HTTP call to openai-driver (which holds the key + calls OpenAI) runs in a
+    # thread so it doesn't stall the event loop — same shape the direct SDK call used.
+    return (await asyncio.to_thread(shimpzopenai.transcribe, path, STT_MODEL)).strip()
+
+
+async def synthesize(text: str):
+    if not _voice_on or not text.strip():
+        return None
+    snippet = text[:TTS_MAX]
+    fd, out = tempfile.mkstemp(suffix=".ogg")
+    os.close(fd)  # only the path is needed; the sidecar's audio bytes are written to it
+
+    def _s():
+        audio = shimpzopenai.speech(snippet, model=TTS_MODEL, voice=TTS_VOICE, response_format="opus")
+        Path(out).write_bytes(audio)
+
+    try:
+        await asyncio.to_thread(_s)
+    except (shimpzopenai.OpenAIDriverError, OSError) as e:
+        log.warning("TTS failed: %s", e)
+        with contextlib.suppress(OSError):  # the mkstemp'd file is orphaned on this path — clean it up
+            await asyncio.to_thread(Path(out).unlink)
+        return None
+    else:
+        return out
+
+
+# --- helpers -----------------------------------------------------------------------
+def allowed(update: Update) -> bool:
+    u = update.effective_user
+    return bool(u) and u.id in ALLOWED
+
+
+async def keep_typing(bot, chat_id, action, stop: asyncio.Event):
+    while not stop.is_set():
+        with contextlib.suppress(TelegramError):
+            await bot.send_chat_action(chat_id, action)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=5)
+
+
+def _tg_html(s: str) -> str:
+    """Convert the model's GitHub-ish markdown to Telegram-safe HTML, which is far more forgiving than MarkdownV2.
+
+    Code spans are stashed so their contents aren't mangled, then HTML entities escaped, then
+    inline formatting applied.
+    """
+    blocks = []
+    # require the newline after the fence so a single-line ``` ```code``` ``` isn't misread as an empty
+    # block (which dropped its text) — a one-line span then falls through to the inline-code rule below.
+    s = re.sub(
+        r"```[^\n]*\n(.*?)```",
+        lambda m: blocks.append(m.group(1)) or f"\x00{len(blocks) - 1}\x00",
+        s,
+        flags=re.DOTALL,
+    )
+    inlines = []
+    s = re.sub(
+        r"`([^`\n]+)`",
+        lambda m: inlines.append(m.group(1)) or f"\x01{len(inlines) - 1}\x01",
+        s,
+    )
+    s = html.escape(s, quote=False)
+    # escape a `"` inside the captured URL (quote=False above left it raw) so an adversarial link like
+    # [x](https://e"vil) can't break the href attribute → a rejected parse → lost formatting. (`&` in the
+    # URL is already escaped by the quote=False pass above, so don't re-escape the whole URL.)
+    s = re.sub(
+        r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+        lambda m: f'<a href="{m.group(2).replace(chr(34), "&quot;")}">{m.group(1)}</a>',
+        s,
+    )
+    s = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", s)
+    # NB: no __double-underscore__ bold — it can't be told apart from a code identifier like __init__ /
+    # __all__ (both are flanked by spaces/punctuation), so it bolded dunders in prose. **bold** covers it.
+    s = re.sub(r"(?<![*\w])\*(?!\*)([^*\n]+?)\*(?!\*)", r"<i>\1</i>", s)  # *italic*, not bullets
+    out = []
+    for ln in s.split("\n"):
+        h = re.match(r"^\s*#{1,6}\s+(.*)$", ln)
+        if h:
+            out.append(f"<b>{h.group(1)}</b>")
+            continue
+        b = re.match(r"^(\s*)[-*+]\s+(.*)$", ln)
+        if b:
+            out.append(f"{b.group(1)}• {b.group(2)}")
+            continue
+        out.append(ln)
+    s = "\n".join(out)
+    for i, c in enumerate(inlines):
+        s = s.replace(f"\x01{i}\x01", f"<code>{html.escape(c, quote=False)}</code>")
+    for i, c in enumerate(blocks):
+        s = s.replace(f"\x00{i}\x00", f"<pre>{html.escape(c, quote=False)}</pre>")
+    return s
+
+
+def _voice_pref_label(chat_id, hint=False):
+    """The chat's voice-reply pref as a LOCALIZED display label (the stored values stay English keys)."""
+    pref = SPEAK_PREF.get(chat_id)
+    if pref == "always":
+        return _t("voice_always", chat_id=chat_id)
+    if pref == "never":
+        return _t("voice_never", chat_id=chat_id)
+    return _t("voice_auto_hint" if hint else "voice_auto", chat_id=chat_id)
+
+
+def main_menu(chat_id):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(_t("btn_desktop", chat_id=chat_id), url=DESKTOP_URL),
+                InlineKeyboardButton(_t("btn_files", chat_id=chat_id), callback_data="menu:files"),
+            ],
+            [
+                InlineKeyboardButton(_t("btn_new_conversation", chat_id=chat_id), callback_data="menu:reset"),
+                InlineKeyboardButton(_t("btn_status", chat_id=chat_id), callback_data="menu:status"),
+            ],
+            [
+                InlineKeyboardButton(
+                    _t("btn_voice_reply", _voice_pref_label(chat_id), chat_id=chat_id), callback_data="menu:voice"
+                )
+            ],
+        ]
+    )
+
+
+# --- IPC bridge: approvals / captcha handoff --------------------------------------
+def _ask_card(rid, text, d, chat_id=None):
+    """Render ONE shimpz-ask request as (options, body, keyboard) — PURE, unit-tested.
+
+    One button per option (max 8) + the automatic "✍️ Answer it myself". `default` (1-based, from
+    `shimpz-ask --default N`) stars its button and the body says the timeout will pick it — honored
+    only when it points inside the (possibly truncated) option list, so a garbage payload can never
+    mis-star or crash the watcher. The returned options are RAW (the ⭐ is presentation only): the
+    tapped answer delivered back to the brain must never carry the star.
+
+    chat_id: these cards are always sent to OWNER (the single approved user), so ipc_watcher passes
+    chat_id=OWNER_CID — OWNER's own /lang choice is the "session" that matters here.
+    """
+    opts = [str(o) for o in (d.get("options") or [])][:8]
+    dflt = d.get("default")
+    di = dflt - 1 if isinstance(dflt, int) and 1 <= dflt <= len(opts) else None
+    rows = [
+        [InlineKeyboardButton(("⭐ " + o if i == di else o)[:60], callback_data=f"ask:{rid}:{i}")]
+        for i, o in enumerate(opts)
+    ]
+    rows.append([InlineKeyboardButton(_t("btn_answer_myself", chat_id=chat_id), callback_data=f"ask:{rid}:free")])
+    body = _t("ask_body", text, chat_id=chat_id)
+    if di is not None:
+        t = d.get("timeout")
+        mins = max(1, (t if isinstance(t, int) and t > 0 else 600) // 60)
+        body += _t("ask_default_note", mins, chat_id=chat_id)
+    return opts, body, InlineKeyboardMarkup(rows)
+
+
+async def ipc_watcher(app):
+    IPC_DIR.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            # GC: drop cached options for asks that are no longer pending (the requester timed out and
+            # unlinked its files) so ASK_OPTS can't grow forever on unanswered asks.
+            for stale in [
+                rid
+                for rid in list(ASK_OPTS)
+                if not any((IPC_DIR / f"{rid}{s}").exists() for s in (".req", ".sent", ".await"))
+            ]:
+                ASK_OPTS.pop(stale, None)
+            for rid, req, d in shimpzipc.pending(IPC_DIR):  # shared queue reader (glob/parse/.bad in shimpzipc)
+                typ = d.get("type", "approve")
+                text = (d.get("text") or "").strip()[:1500]
+                if typ == "ask":
+                    opts, body, kb = _ask_card(rid, text, d, chat_id=OWNER_CID)
+                    ASK_OPTS[rid] = opts
+                elif typ == "captcha":
+                    resolved_lbl = _t("btn_resolved", chat_id=OWNER_CID)
+                    cancel_lbl = _t("btn_cancel", chat_id=OWNER_CID)
+                    kb = InlineKeyboardMarkup(
+                        [
+                            [InlineKeyboardButton(_t("btn_open_desktop", chat_id=OWNER_CID), url=DESKTOP_URL)],
+                            [
+                                InlineKeyboardButton(resolved_lbl, callback_data=f"cap:{rid}:ok"),
+                                InlineKeyboardButton(cancel_lbl, callback_data=f"cap:{rid}:no"),
+                            ],
+                        ]
+                    )
+                    tail = _t("captcha_tail", chat_id=OWNER_CID)
+                    body = _t("captcha_body", text, tail, chat_id=OWNER_CID)
+                else:
+                    approve_lbl = _t("btn_approve", chat_id=OWNER_CID)
+                    deny_lbl = _t("btn_deny", chat_id=OWNER_CID)
+                    kb = InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(approve_lbl, callback_data=f"ap:{rid}:ok"),
+                                InlineKeyboardButton(deny_lbl, callback_data=f"ap:{rid}:no"),
+                            ]
+                        ]
+                    )
+                    body = _t("approval_body", text, chat_id=OWNER_CID)
+                # DEQUEUE FIRST, then deliver — at-most-once. The gateway restarts often (checkpoints,
+                # rebuilds); the old order (send → then mark_sent) re-delivered any request caught in
+                # that window on restart, so the owner saw the SAME approval twice. Marking sent first
+                # means a crash mid-delivery loses at most one send, which fails SAFE: the requester
+                # times out and the agent does NOT proceed (shimpz-approve treats no-answer as "don't act").
+                shimpzipc.mark_sent(req)
+                try:
+                    await app.bot.send_message(OWNER, body, reply_markup=kb)
+                except (TelegramError, OSError) as e:
+                    # A TRANSIENT send error (not a crash) → requeue for one more pass so a genuinely
+                    # undelivered request isn't silently lost. (A crash here can't reach this line, so
+                    # it can't re-deliver — exactly the duplicate we're removing.)
+                    log.warning("ipc send failed for %s: %s — requeueing", rid, e)
+                    shimpzipc.mark_unsent(req)
+        except Exception as e:  # noqa: BLE001 — ipc_watcher daemon loop must never die
+            log.warning("ipc watcher: %s", e)
+        await asyncio.sleep(1)
+
+
+async def _edit(q, text):
+    """Best-effort edit of the tapped card's text — a stale/deleted message must never crash the handler."""
+    with contextlib.suppress(TelegramError):
+        await q.edit_message_text(text)
+
+
+def _reset_chat(cid: str):
+    """Forget the chat's session + rolling recent window — the next message starts a fresh context."""
+    SESSIONS.pop(cid, None)
+    _save_sessions(SESSIONS)
+    _recent_path(cid).unlink(missing_ok=True)
+
+
+async def _cb_stoprun(q, data):
+    # Kill the live brain run — but ONLY if the tap's run-id (the pid stamped on its Stop button)
+    # matches the run currently live in this chat. A stale/late/double tap carries a finished run's
+    # pid → no match → we don't murder an unrelated later run. CANCELLED lets run_claude label it
+    # 'cancelled' (not a crash) and edit the SAME card to '🛑 Stopped.' — nothing new is sent.
+    cid = str(q.message.chat_id)
+    token = data.split(":", 1)[1] if ":" in data else ""
+    proc = RUN_PROCS.get(cid)
+    if proc is not None and proc.returncode is None and str(proc.pid) == token:
+        # exact match on THIS run's pid → kill the brain tree + mark CANCELLED (shimpzchat.stop does both:
+        # _kill_tree(proc) takes down claude AND its tool children, CANCELLED lets run_claude label it
+        # 'cancelled' and edit the SAME card to '🛑 Stopped.'). The run-id guard above is unchanged.
+        shimpzchat.stop(cid)
+    else:
+        await _edit(q, _t("nothing_running", chat_id=cid))
+
+
+async def _cb_rerun(q, ctx, task, banner, force_continue=False):
+    # Re-run (retry / continue), REUSING the tapped card as the live message (no new message).
+    cid = str(q.message.chat_id)
+    card = LiveCard(ctx.bot, cid, mid=q.message.message_id)
+    await card.update(banner)
+    async with _lock_for(cid):
+        final_text, subtype = await run_task(ctx.bot, cid, task, force_continue=force_continue, card=card)
+    return await _finish(ctx.bot, cid, final_text, subtype, False, card=card)
+
+
+async def _cb_menu(q, what):
+    cid = str(q.message.chat_id)
+    if what == "reset":
+        _reset_chat(cid)
+        await q.edit_message_text(_t("reset_msg", chat_id=cid))
+    elif what == "voice":
+        # cycle the per-chat voice-reply policy: auto → always → never → auto
+        cur = SPEAK_PREF.get(cid)
+        nxt = {None: "always", "always": "never", "never": None}[cur]
+        if nxt is None:
+            SPEAK_PREF.pop(cid, None)
+        else:
+            SPEAK_PREF[cid] = nxt
+        _save_prefs()  # survives a gateway restart (prefs.json)
+        with contextlib.suppress(TelegramError):
+            await q.edit_message_reply_markup(reply_markup=main_menu(cid))
+    elif what == "status":
+        up = int(time.monotonic() - START_MONO)
+        model = os.environ.get("SHIMPZ_MODEL", "claude-sonnet-5")
+        sid = SESSIONS.get(cid)
+        # max(...,0): _session_bytes returns -1 for an unmeasurable session; show 0KB, not -1.
+        sz = (max(await asyncio.to_thread(_session_bytes, sid), 0) // 1024) if sid else 0
+        running = _t("word_yes" if RUN_PROCS.get(cid) is not None else "word_no", chat_id=cid)
+        await q.edit_message_text(
+            _t(
+                "status_card",
+                up // 3600,
+                (up % 3600) // 60,
+                model,
+                running,
+                sz,
+                SHIMPZ_CTX_MAX_BYTES // 1024,
+                len(SESSIONS),
+                _t("word_on" if _voice_on else "word_off", chat_id=cid),
+                _voice_pref_label(cid, hint=True),
+                chat_id=cid,
+            )
+        )
+    elif what == "files":
+        # the workspace can hold many files — glob it off the event loop
+        files = await asyncio.to_thread(lambda: sorted(p.name for p in Path(WORKDIR).glob("*") if p.is_file())[:30])
+        txt = _t("files_header", chat_id=cid) + (
+            "\n".join(f"• {f}" for f in files) if files else _t("files_empty", chat_id=cid)
+        )
+        await q.edit_message_text(txt)
+
+
+async def _cb_ask(q, data):
+    _, rid, sel = data.split(":", 2)
+    cid = str(q.message.chat_id)
+    if not _RID_RE.fullmatch(rid):
+        # rid is interpolated into IPC file paths (<rid>.await/.resp/.sent) — never let a malformed
+        # or legacy-format callback drive a write outside the flat 12-hex-char namespace it minted.
+        return await q.answer(text=_t("stale_button", chat_id=cid))
+    if sel == "free":
+        AWAITING_FREE[cid] = rid
+        # persist the marker so a gateway restart can still route the next message to this ask
+        with contextlib.suppress(OSError):
+            (IPC_DIR / f"{rid}.await").write_text(cid)
+        await _edit(q, f"{q.message.text}{_t('ask_free_suffix', chat_id=cid)}")
+        return None
+    opts = ASK_OPTS.get(rid)
+    if opts is None:  # gateway restarted → recover the options from the persisted request file
+        try:
+            opts = json.loads((IPC_DIR / f"{rid}.sent").read_text()).get("options", [])
+        except json.JSONDecodeError, OSError:
+            opts = []
+    try:
+        answer = opts[int(sel)]
+    except ValueError, IndexError:
+        log.exception("ask %s: cannot resolve option %r (opts=%s)", rid, sel, opts)
+        await _edit(q, f"{q.message.text}{_t('ask_resolve_fail_suffix', chat_id=cid)}")
+        return None  # FAIL-FAST: never write a garbage index back as the answer
+    delivered = shimpzipc.answer(IPC_DIR, rid, {"answer": answer})
+    ASK_OPTS.pop(rid, None)
+    if delivered:
+        await _edit(q, f"{q.message.text}\n\n— ✅ {answer}")
+    else:
+        # answer() returns False when the requester already timed out and cleaned up — don't claim
+        # it was delivered (the brain never saw it).
+        await _edit(q, f"{q.message.text}\n\n— {_t('ask_expired_moved_on', chat_id=cid)}")
+    return None
+
+
+async def _cb_lang(q, ctx, data):
+    # /lang button tap: pt or en. Set LANG_PREF FIRST, then render the confirmation through _t() —
+    # that's what makes the confirmation card the actual proof-of-life that the switch took effect
+    # (it renders in the language JUST chosen, not the chat's previous one).
+    cid = str(q.message.chat_id)
+    lang = data.split(":", 1)[1] if ":" in data else ""
+    if lang not in ("pt", "en"):
+        return await q.answer(text=_t("stale_button", chat_id=cid))
+    LANG_PREF[cid] = lang
+    _save_prefs()  # survives a gateway restart (prefs.json)
+    await q.edit_message_text(_t("lang_set_confirm", chat_id=cid))
+    await _set_chat_commands(ctx.bot, cid)  # the `/` command menu follows the choice too
+    return None
+
+
+async def _cb_decision(q, data):
+    # approval / captcha decision
+    cid = str(q.message.chat_id)
+    try:
+        kind, rid, decision = data.split(":", 2)
+    except ValueError:
+        return None
+    if kind not in ("ap", "cap") or not _RID_RE.fullmatch(rid):
+        # only known kinds + a well-formed rid reach answer()
+        return await q.answer(text=_t("stale_button", chat_id=cid))
+    delivered = shimpzipc.answer(IPC_DIR, rid, {"decision": decision})
+    ok = decision == "ok"
+    if not delivered:
+        # Requester already timed out and cleaned up → the brain saw a timeout-deny, NOT this tap. Don't
+        # show a green "✅ Approved" for a decision that never reached it.
+        await _edit(q, f"{q.message.text}\n\n— {_t('decision_expired_timed_out', chat_id=cid)}")
+        return None
+    yes, no = (
+        (_t("decision_approved", chat_id=cid), _t("decision_denied", chat_id=cid))
+        if kind == "ap"
+        else (_t("decision_resolved", chat_id=cid), _t("decision_cancelled", chat_id=cid))
+    )
+    label = yes if ok else no
+    await _edit(q, f"{q.message.text}\n\n— {label}")
+    return None
+
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data or ""
+    cid = str(q.message.chat_id)
+    # q.answer() is a tap-acknowledgement (stops the button spinner); passing text shows a small toast.
+    # On gateway restart Telegram re-delivers queued taps that are now STALE → answer() raises BadRequest
+    # ("Query is too old"). That must NOT crash the handler (it was spamming ERROR+traceback). Best-effort.
+    _verb = data.split(":", 1)[0]  # `stoprun` now carries the run pid as `stoprun:<pid>`
+    _toast = {
+        "stoprun": _t("toast_stopping", chat_id=cid),
+        "retry": _t("toast_retrying", chat_id=cid),
+        "cont": _t("toast_continuing", chat_id=cid),
+        "halt": _t("toast_stopped", chat_id=cid),
+    }.get(_verb)
+    try:
+        await q.answer(**({"text": _toast} if _toast else {}))
+    except TelegramError as e:
+        log.debug("callback ack failed (stale query?): %s", e)
+    if not (q.from_user and q.from_user.id in ALLOWED):
+        return None
+    if _verb == "stoprun":
+        return await _cb_stoprun(q, data)
+    if data == "retry":
+        # Re-run the last task (nothing recorded → say so instead of a silent no-op).
+        task = LAST_TASK.get(cid)
+        if not task:
+            return await _edit(q, _t("nothing_to_retry", chat_id=cid))
+        return await _cb_rerun(q, ctx, task, _t("toast_retrying", chat_id=cid))
+    if data == "cont":
+        return await _cb_rerun(
+            q,
+            ctx,
+            "Continue exactly from where you left off.",
+            _t("continuing_banner", chat_id=cid),
+            force_continue=True,
+        )
+    if data == "halt":
+        await _edit(q, _t("stopped_here_msg", chat_id=cid))
+        return None
+    if data.startswith("menu:"):
+        return await _cb_menu(q, data.split(":", 1)[1])
+    if data.startswith("ask:"):
+        return await _cb_ask(q, data)
+    if data.startswith("lang:"):
+        return await _cb_lang(q, ctx, data)
+    return await _cb_decision(q, data)
+
+
+# --- command handlers --------------------------------------------------------------
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = str(update.effective_chat.id)
+    if not allowed(update):
+        return await update.message.reply_text(_t("access_denied", chat_id=cid))
+    await update.message.reply_text(
+        _t("start_msg", chat_id=cid),
+        reply_markup=main_menu(cid),
+    )
+    return None
+
+
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    cid = str(update.effective_chat.id)
+    await update.message.reply_text(_t("menu_title", chat_id=cid), reply_markup=main_menu(cid))
+
+
+async def cmd_desktop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    cid = str(update.effective_chat.id)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(_t("btn_open_desktop", chat_id=cid), url=DESKTOP_URL)]])
+    await update.message.reply_text(_t("desktop_msg", chat_id=cid), reply_markup=kb)
+
+
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    cid = str(update.effective_chat.id)
+    _reset_chat(cid)
+    await update.message.reply_text(_t("reset_msg", chat_id=cid))
+
+
+async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/clear: wipe the visible Telegram chat AND the brain context (a /reset plus message deletion).
+
+    Private-chat message ids are sequential across both sides, so the sweep walks down from the
+    /clear message's own id in 100-id chunks (deleteMessages' per-call cap) and lets the API skip
+    ids that don't exist. Bots can't delete messages older than 48h — the confirmation says so
+    instead of pretending the wipe was total. A chunk-level TelegramError is logged loudly and the
+    sweep goes on: one bad chunk must not strand the rest of the history.
+    """
+    if not allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    cid = str(chat_id)
+    _reset_chat(cid)
+    top = update.message.message_id  # includes the /clear message itself
+    low = max(1, top - SHIMPZ_CLEAR_SWEEP + 1)
+    for hi in range(top, low - 1, -100):
+        ids = list(range(max(low, hi - 99), hi + 1))
+        try:
+            await ctx.bot.delete_messages(chat_id=chat_id, message_ids=ids)
+        except TelegramError as e:
+            log.warning("/clear: delete_messages chunk %s..%s failed: %s", ids[0], ids[-1], e)
+    await ctx.bot.send_message(chat_id, _t("clear_msg", chat_id=cid))
+
+
+async def _seed_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Seed a first-seen chat's language from Telegram's client locale (user.language_code).
+
+    Registered in group -1, so it runs for EVERY update before the real handlers. A persisted
+    LANG_PREF entry (an earlier /lang tap or seed) always wins; the seed only fills the gap — so a
+    pt-BR phone gets Portuguese without ever typing /lang. Persisted so IPC-originated cards
+    (approvals/asks, sent to OWNER outside any update) render right even just after a restart.
+    """
+    u, chat = update.effective_user, update.effective_chat
+    if not (u and chat and u.id in ALLOWED):
+        return
+    cid = str(chat.id)
+    if cid in LANG_PREF:
+        return
+    lc = (u.language_code or "").lower()
+    lang = "pt" if lc.startswith("pt") else ("en" if lc else None)
+    if lang and lang != SHIMPZ_UI_LANG:  # matching the env default needs no per-chat entry
+        LANG_PREF[cid] = lang
+        _save_prefs()
+        await _set_chat_commands(ctx.bot, cid)  # the `/` command menu follows the seed too
+
+
+async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/lang: two inline buttons (pt/en) to flip THIS chat's language live (see LANG_PREF, _cb_lang)."""
+    if not allowed(update):
+        return
+    cid = str(update.effective_chat.id)
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(_t("lang_btn_pt", chat_id=cid), callback_data="lang:pt"),
+                InlineKeyboardButton(_t("lang_btn_en", chat_id=cid), callback_data="lang:en"),
+            ]
+        ]
+    )
+    await update.message.reply_text(_t("lang_prompt", chat_id=cid), reply_markup=kb)
+
+
+# --- login over Telegram (when the brain is logged out of Claude Code) --------------
+def _login_prompt(url: str, chat_id=None) -> str:
+    """The message that hands Juliano the login link + instructions.
+
+    PLAIN text (no HTML/markdown) so the &-heavy OAuth URL is never mangled by entity-escaping or
+    link parsing.
+    """
+    return _t("login_prompt", url, chat_id=chat_id)
+
+
+# shimpz-login writes its result as {"ok", "code", "args", "message"} — the code names the OUTCOME and
+# the args carry the untranslatable data (email, exit code, raw CLI line), so the gateway can render
+# it in the chat's language instead of parroting the bridge's English prose (R106).
+_LOGIN_RESULT_KEYS = {
+    "logged_in_as": "login_res_logged_in_as",
+    "logged_in": "login_res_logged_in",
+    "cli_output": "login_res_cli_output",
+    "failed_exit": "login_res_failed_exit",
+    "timeout": "login_res_timeout",
+    "error": "login_res_error",
+    "ended_unexpectedly": "login_res_ended_unexpectedly",
+}
+
+
+def _login_result_text(res: dict, chat_id=None) -> str:
+    """Localize ONE shimpz-login bridge result — exact {code}→key lookup, fail-fast on an unknown code.
+
+    A result with no "code" at all (a bridge from before this contract, still mid-flight across a
+    deploy) shows its raw "message" — faithful display of old data, not a bug-masking default.
+    """
+    code = res.get("code")
+    if code is None:
+        return str(res.get("message", ""))
+    return _t(_LOGIN_RESULT_KEYS[code], *res.get("args", ()), chat_id=chat_id)
+
+
+def _looks_logged_out(text: str) -> bool:
+    """True only on well-known auth-failure phrases — so a normal brain error never nags about /login."""
+    t = (text or "").lower()
+    return any(
+        s in t
+        for s in (
+            "invalid api key",
+            "unauthorized",
+            "not logged in",
+            "logged out",
+            "authentication_error",
+            "oauth token",
+            "credentials expired",
+            "please login",
+            "please log in",
+            "run claude login",
+        )
+    )
+
+
+def _maybe_auth_hint(final_text: str, err: str, chat_id=None) -> str:
+    """Append the /login hint to a no-output brain message IFF it looks like an auth failure.
+
+    PURE, so the integration (not just the detector) is unit-tested. Idempotent: never
+    double-appends. R99: the hint is now resolved PER CALL (via chat_id) rather than a module-level
+    constant, so the idempotency check compares against the SAME chat's active-language hint.
+    """
+    hint = _t("login_auth_hint", chat_id=chat_id)
+    if hint in (final_text or ""):
+        return final_text
+    if _looks_logged_out(err) or _looks_logged_out(final_text):
+        return (final_text or "") + hint
+    return final_text
+
+
+# _interrupted + _no_output_message moved to shimpzchat.py (re-exported above): the no-output branch now
+# runs inside shimpzchat.run_claude with the resolved `lang`. shimpzchat keeps its own lang-based
+# _maybe_auth_hint/_looks_logged_out; the chat_id-keyed pair above stays for the gateway's callers.
+
+
+async def _poll_file(path, tries, parse=str.strip):
+    """Poll the shimpz-login bridge file at `path` (every LOGIN_POLL_S, up to `tries` reads).
+
+    Returns parse(contents) as soon as it's truthy, else None once the budget runs out.
+    """
+    for _ in range(tries):
+        try:
+            val = parse(path.read_text())
+        except OSError, json.JSONDecodeError:
+            val = None
+        if val:
+            return val
+        await asyncio.sleep(LOGIN_POLL_S)
+    return None
+
+
+def _login_await(chat_id: str) -> bool:
+    """Restart-survival: a persisted marker so a restarted gateway still routes the pasted code.
+
+    Routes to the (still-alive, detached) shimpz-login bridge.
+    """
+    try:
+        return (LOGIN_DIR / "await").read_text().strip() == chat_id
+    except OSError:
+        return False
+
+
+async def cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return None
+    cid = str(update.effective_chat.id)
+    # A login is already mid-flow for this chat (in-memory state OR the restart-survival marker) → the
+    # next message is the code; don't restart the exchange. Concurrent BRIDGES can't race: shimpz-login
+    # itself holds a singleton flock per LOGIN_DIR and a 2nd `run` refuses to start.
+    if AWAITING_LOGIN.get(cid) or _login_await(cid):
+        return await update.message.reply_text(_t("login_in_progress", chat_id=cid))
+    # already logged in? don't start a needless flow.
+    try:
+        st = await asyncio.create_subprocess_exec(
+            SHIMPZ_LOGIN,
+            "status",
+            "--json",
+            env=shimpzenv.brain_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        # bounded: if `shimpz-login status` (which shells `claude auth`) ever wedges before its own
+        # timeout fires, don't hang the /login handler forever — kill it and fall through to a login.
+        try:
+            so, _ = await asyncio.wait_for(st.communicate(), timeout=40)
+        except TimeoutError:
+            with contextlib.suppress(OSError):
+                st.kill()
+            raise
+        if st.returncode == 0:
+            # status --json → {"loggedIn", "email"}; show the localized template with just the email
+            # (fail-fast: unparseable output raises to the error handler, never a silent wrong reply).
+            who = json.loads(so.decode() or "{}").get("email") or "Claude Code"
+            return await update.message.reply_text(_t("login_already_logged_in", who, chat_id=cid))
+    except (OSError, TimeoutError) as e:
+        # can't check status → proceed to a fresh login (fail-open), but SURFACE it, never silent.
+        log.warning("login status probe failed, starting login anyway: %s", e)
+    LOGIN_DIR.mkdir(parents=True, exist_ok=True)
+    for f in ("url", "code", "result", "await"):
+        # absent (normal) or an odd non-file — best-effort clear
+        with contextlib.suppress(OSError):
+            (LOGIN_DIR / f).unlink()
+    try:
+        # DETACHED (start_new_session): the bridge holds the live PKCE state and must SURVIVE a gateway
+        # restart so the code can still be pasted afterwards. It writes the result + exits on its own.
+        await asyncio.create_subprocess_exec(
+            SHIMPZ_LOGIN,
+            "run",
+            start_new_session=True,
+            env=shimpzenv.brain_env(),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError as e:
+        return await update.message.reply_text(_t("login_start_fail", e, chat_id=cid))
+    await update.message.reply_text(_t("login_starting", chat_id=cid))
+    url = await _poll_file(LOGIN_DIR / "url", LOGIN_URL_TRIES)  # poll the bridge for the URL
+    if not url:
+        # the bridge never produced a link → DO NOT arm the message-hijack path (no marker, no state).
+        return await update.message.reply_text(_t("login_no_link", chat_id=cid))
+    AWAITING_LOGIN[cid] = 1
+    try:
+        (LOGIN_DIR / "await").write_text(cid)
+    except OSError as e:
+        log.warning(
+            "could not persist login await-marker (restart-survival off this attempt): %s",
+            e,
+        )
+    await ctx.bot.send_message(cid, _login_prompt(url, chat_id=cid), disable_web_page_preview=True)
+    return None
+
+
+async def _submit_login_code(ctx, chat_id, code, msg):
+    """The pasted code → hand it to the waiting shimpz-login bridge, then report the result."""
+    AWAITING_LOGIN.pop(chat_id, None)
+    (LOGIN_DIR / "await").unlink(missing_ok=True)
+    try:
+        # ATOMIC write (shimpzipc.atomic_write: tmp + rename) so the bridge's read never sees a partial/empty
+        # code file mid-write and silently drops the pasted credential (url/result use the same helper in
+        # shimpz-login).
+        shimpzipc.atomic_write(LOGIN_DIR / "code", code.strip())
+    except OSError as e:
+        return await msg.reply_text(_t("login_code_send_fail", e, chat_id=chat_id))
+    await msg.reply_text(_t("login_code_received", chat_id=chat_id))
+    # poll for the OAuth-exchange result
+    res = await _poll_file(LOGIN_DIR / "result", LOGIN_RESULT_TRIES, parse=json.loads)
+    if not res:
+        return await msg.reply_text(_t("login_result_timeout", chat_id=chat_id))
+    detail = _login_result_text(res, chat_id=chat_id)
+    if res.get("ok"):
+        await msg.reply_text(_t("login_done", detail, chat_id=chat_id))
+    else:
+        await msg.reply_text(_t("login_failed", detail, chat_id=chat_id))
+    return None
+
+
+def _is_image(msg) -> bool:
+    """A photo, or a document sent uncompressed with an image mime-type (the two ways Telegram delivers a picture).
+
+    Everything else (voice/audio/text) is handled elsewhere.
+    """
+    return bool(msg.photo) or bool(msg.document and (msg.document.mime_type or "").startswith("image/"))
+
+
+async def _incoming_image(msg) -> str:
+    """Download the image into the workspace so the brain can SEE it (Claude Code reads images with the Read tool).
+
+    Returns the saved path. Photos come in several sizes — take the LAST (highest resolution); a
+    document keeps its own extension. Fail-fast: a download error raises to the caller (never a
+    silent 'image ignored').
+    """
+    INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+    if msg.photo:
+        tgfile = await msg.photo[-1].get_file()
+        ext = ".jpg"
+    else:
+        tgfile = await msg.document.get_file()
+        # The extension is the ONLY attacker-influenced part of the name — clamp it to a safe token
+        # (dot + 1–8 alnum) and default otherwise, so a hostile file_name ('../../etc/x') can never
+        # steer the path outside INCOMING_DIR. The basename is always the numeric message_id.
+        raw_ext = Path(msg.document.file_name or "").suffix
+        ext = raw_ext if re.fullmatch(r"\.[A-Za-z0-9]{1,8}", raw_ext or "") else ".jpg"
+    dest = INCOMING_DIR / (f"tg_{msg.message_id}{ext}")
+    await tgfile.download_to_drive(str(dest))
+    return str(dest)
+
+
+async def _incoming_document(msg) -> str:
+    """Download ANY non-image document (PDF, CSV, code, zip, …) into the workspace for the brain to read.
+
+    Gets the same intake images already have. Keeps the original filename (so the brain sees a
+    meaningful name) but SANITIZED to a bare basename: the name is attacker-influenced, so we
+    strip any path and clamp to a safe token set, and always prefix the numeric message_id.
+    Fail-fast: a download error raises to the caller (never a silent 'file ignored'). Returns the
+    saved path.
+    """
+    INCOMING_DIR.mkdir(parents=True, exist_ok=True)
+    tgfile = await msg.document.get_file()
+    raw = Path(msg.document.file_name or "").name  # drop any directory component
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw).lstrip(".") or "file"
+    dest = INCOMING_DIR / f"tg_{msg.message_id}_{safe}"
+    await tgfile.download_to_drive(str(dest))
+    return str(dest)
+
+
+async def _intake(msg, ctx, chat_id, spoke):
+    """Turn ONE incoming Telegram message into brain input: transcribe voice, download an image/doc, or use the text.
+
+    Returns (user_text, img_path, doc_path) — or None when the turn already ended here (unusable
+    input; the user was told).
+    """
+    img = None
+    doc = None
+    if spoke:
+        if not _voice_on:
+            await msg.reply_text(_t("stt_not_configured", chat_id=chat_id))
+            return None
+        stop = asyncio.Event()
+        typ = asyncio.create_task(keep_typing(ctx.bot, chat_id, ChatAction.TYPING, stop))
+        tmp = None
+        try:
+            tgfile = await (msg.voice or msg.audio).get_file()
+            fd, tmp = tempfile.mkstemp(suffix=".ogg")
+            os.close(fd)  # only the path is needed; Telegram downloads into it
+            await tgfile.download_to_drive(tmp)
+            user_text = await transcribe(tmp)
+        except (OSError, TelegramError, shimpzopenai.OpenAIDriverError) as e:
+            # mirror the image/document branches: a transient fetch/transcribe error is friendly, not a crash
+            log.warning("voice download/transcribe failed: %s", e)
+            await msg.reply_text(_t("audio_fetch_fail", chat_id=chat_id))
+            return None
+        finally:
+            stop.set()
+            await typ
+            if tmp:  # the downloaded .ogg is transient — never leak it
+                with contextlib.suppress(OSError):
+                    await asyncio.to_thread(Path(tmp).unlink)
+        if not user_text:
+            await msg.reply_text(_t("audio_understand_fail", chat_id=chat_id))
+            return None
+        # HTML (not legacy Markdown): html.escape is the matching escaper, and a transcript with an
+        # odd count of _/*/` (e.g. STT emits "snake_case") no longer makes Telegram reject the message
+        # with a parse error that would abort the whole turn BEFORE the brain runs.
+        await msg.reply_text(f"🎙️ <i>{html.escape(user_text)}</i>", parse_mode="HTML")
+    elif _is_image(msg):
+        # Download it and hand the PATH to the brain; the caption (if any) is the instruction.
+        try:
+            img = await _incoming_image(msg)
+        except (OSError, TelegramError) as e:
+            log.warning("image download failed: %s", e)
+            await msg.reply_text(_t("image_download_fail", chat_id=chat_id))
+            return None
+        user_text = (msg.caption or "").strip()
+    elif msg.document:
+        # Any non-image document (PDF/CSV/code/zip/…) → download into the workspace and hand the PATH
+        # to the brain (the caption is the instruction). Previously these matched no handler and were
+        # silently dropped.
+        try:
+            doc = await _incoming_document(msg)
+        except (OSError, TelegramError) as e:
+            log.warning("document download failed: %s", e)
+            await msg.reply_text(_t("doc_download_fail", chat_id=chat_id))
+            return None
+        user_text = (msg.caption or "").strip()
+    else:
+        user_text = (msg.text or "").strip()
+        if not user_text:
+            return None
+    return user_text, img, doc
+
+
+async def _consume_pending(msg, ctx, chat_id, user_text):
+    """Text-only consumers that must run BEFORE the brain: a mid-login OAuth code, or a pending shimpz-ask reply.
+
+    Returns True when this message was consumed (the turn ends here), False when it should proceed
+    to the brain as a normal task.
+    """
+    # Mid-login: this message is the OAuth code → finish the login via the shimpz-login bridge, don't
+    # spin up the brain on it. (Marker file makes it survive a gateway restart, like shimpz-ask.)
+    if AWAITING_LOGIN.get(chat_id) or _login_await(chat_id):
+        await _submit_login_code(ctx, chat_id, user_text, msg)
+        return True
+
+    # If Shimpz asked a question and Juliano chose "✍️ Answer it myself", this message IS the
+    # answer — hand it back to the blocked shimpz-ask, don't spin up Claude on it.
+    rid = AWAITING_FREE.pop(chat_id, None)
+    if not rid:  # gateway may have restarted → recover the 'answer it myself' marker from disk
+        for aw in IPC_DIR.glob("*.await"):
+            try:
+                if aw.read_text().strip() == chat_id:
+                    rid = aw.stem
+                    break
+            except OSError:
+                continue
+    if rid:
+        delivered = shimpzipc.answer(IPC_DIR, rid, {"answer": user_text})
+        ASK_OPTS.pop(rid, None)
+        (IPC_DIR / f"{rid}.await").unlink(missing_ok=True)
+        if delivered:
+            await msg.reply_text(_t("answer_sent", chat_id=chat_id))
+            return True
+        # The ask already timed out and cleaned up: don't swallow this message with a false
+        # confirmation — tell the user and fall through so it's handled as a normal task.
+        await msg.reply_text(_t("ask_expired_new_msg", chat_id=chat_id))
+    return False
+
+
+async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # `allowed_updates=ALL_TYPES` also delivers edited_message updates, for which update.message is
+    # None (the content is in update.edited_message). Every handler here acts on update.message, so
+    # without this guard editing ANY prior message (a routine typo fix) raises AttributeError and the
+    # error handler nags the owner. We intentionally don't re-process edits — act on new messages only.
+    if update.message is None:
+        return None
+    chat_id = str(update.effective_chat.id)
+    if not allowed(update):
+        return await update.message.reply_text(_t("access_denied", chat_id=chat_id))
+    msg = update.message
+    spoke = bool(msg.voice or msg.audio)
+    intake = await _intake(msg, ctx, chat_id, spoke)
+    if intake is None:
+        return None
+    user_text, img, doc = intake
+
+    # An attachment (image/document) is never an OAuth code or a free-text answer — it's always a task
+    # for the brain, so skip the code/answer consumers when one arrived.
+    if not (img or doc) and await _consume_pending(msg, ctx, chat_id, user_text):
+        return None
+
+    # Prepend the attachment path so the brain VIEWS/reads it — kept separate from the saved recent
+    # window (human-readable text).
+    if img:
+        attach_note = f"[Juliano sent you an image — VIEW it with the Read tool at: {img}]\n\n"
+    elif doc:
+        attach_note = f"[Juliano sent you a file — read/inspect it at: {doc}]\n\n"
+    else:
+        attach_note = ""
+    body = user_text
+    task_input = attach_note + body
+    recent_label = body or ("(image)" if img else "(file)" if doc else "")
+    LAST_TASK[chat_id] = task_input  # backs the 🔁 Retry button
+
+    # ONE editable message ("card") carries the whole turn's feedback — status, streamed words, the
+    # final short answer — instead of a flood of new messages. It threads to the request.
+    card = LiveCard(ctx.bot, chat_id, reply_to=msg.message_id)
+
+    # ONE brain per conversation. A second message mid-run would otherwise spawn a second
+    # `claude --resume` on the SAME session id (two writers, one transcript). Serialize per chat;
+    # a follow-up simply waits its turn. No "queued" message — the 👀 reaction is the cue, and the
+    # queued task gets its own card when its turn comes. (Login/free-answer consumers already
+    # returned above, so a mid-run shimpz-ask answer never blocks on this lock — no deadlock.)
+    await _react(ctx.bot, chat_id, msg.message_id, REACT_SEEN)  # instant acknowledgement
+    async with _lock_for(chat_id):
+        final_text, subtype = await run_task(ctx.bot, chat_id, task_input, card=card)
+        # Roll the short conversation window so the next (fresh) task keeps multi-turn coherence.
+        _save_recent(chat_id, recent_label, final_text)
+    await _finish(ctx.bot, chat_id, final_text, subtype, spoke, card=card)
+    # 👍 on success, 😢 on failure/timeout; leave the 👀 (working) on a user-cancelled run.
+    emoji = REACT_DONE if subtype == "success" else (None if subtype == "cancelled" else REACT_FAIL)
+    if emoji:
+        await _react(ctx.bot, chat_id, msg.message_id, emoji)
+    return None
+
+
+_IPC_TASK = None
+
+
+async def _post_init(app):
+    global _IPC_TASK
+    await _sync_command_menus(app.bot)
+    # Make the chat's ☰ button show the command list explicitly (deterministic; always works).
+    # NOTE: a Telegram Mini App button for the desktop is intentionally NOT used — the KasmVNC
+    # desktop sits behind Cloudflare Access, whose interstitial + framing rules break in-app webviews;
+    # the /desktop + Desktop URL button (opens the real browser, carries the Access cookie) is correct.
+    with contextlib.suppress(TelegramError):
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    # Background IPC bridge (approvals / captcha / shimpz-ask buttons). Keep a reference so it's
+    # cancelled cleanly on shutdown (otherwise PTB warns + leaves a pending task on restart).
+    _IPC_TASK = asyncio.get_running_loop().create_task(ipc_watcher(app))
+
+
+async def _post_shutdown(app):
+    if _IPC_TASK and not _IPC_TASK.done():
+        _IPC_TASK.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _IPC_TASK
+
+
+async def _on_error(update, ctx):
+    """No silent failures: log every handler exception AND tell the owner, so the bot never goes quiet ('it's off').
+
+    Without this PTB only logs 'No error handlers registered'.
+    """
+    log.exception("handler error: %s", ctx.error)
+    try:
+        chat = None
+        if isinstance(update, Update):
+            chat = update.effective_chat.id if update.effective_chat else None
+        dest = chat or OWNER
+        await ctx.bot.send_message(dest, _t("handler_error_msg", ctx.error, chat_id=dest))
+    except TelegramError as e:
+        log.warning("could not notify the owner of a handler error: %s", e)
+
+
+def build_app():
+    """Build the Application with every handler wired, extracted from main so the routing is unit-testable.
+
+    In particular, that PHOTO/image-document reaches handle() is testable without run_polling.
+    """
+    # concurrent_updates(True) is LOAD-BEARING, not a nicety: PTB's default (max_concurrent_updates=1)
+    # processes updates strictly sequentially — the fetcher `await`s each handler inline — so while
+    # handle() is parked awaiting the brain (minutes), NO other update dispatches. That silently kills
+    # the whole interactive layer mid-run: the 🛑 Stop tap, and the shimpz-approve/shimpz-captcha/shimpz-ask
+    # button answers the brain BLOCKS on over IPC, are never processed → approvals time out as "no
+    # answer". With concurrency on, each update runs as its own task; the per-chat `_lock_for` lock
+    # (already in place) does the real job of serializing brain RUNS per chat while Stop/approval
+    # callbacks flow. (Single event loop → still no true parallelism; the lock covers run ordering.)
+    builder = (
+        Application.builder()
+        .token(TOKEN)
+        .concurrent_updates(True)
+        .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
+    )
+    # SECURITY_ENGINEERING_PLAN.md item 8 — default-deny brain egress. The brain is off `edge`; its only
+    # route out is the CONNECT allowlist proxy (HTTPS_PROXY). PTB/httpx env-proxy honoring is version-
+    # dependent, so wire it EXPLICITLY via the builder's own .proxy()/.get_updates_proxy() — they set the
+    # proxy on PTB's DEFAULT request objects (preserving the tuned pool sizes + the long-poll read timeout,
+    # which a bare HTTPXRequest(proxy=…) would drop). BOTH are required: getUpdates uses a separate client.
+    _proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if _proxy:
+        builder = builder.proxy(_proxy).get_updates_proxy(_proxy)
+    app = builder.build()
+    # group -1 → runs before every real handler: seed the chat's language from the Telegram client
+    # locale the first time we see it (an explicit /lang choice, once persisted, always wins).
+    app.add_handler(TypeHandler(Update, _seed_lang), group=-1)
+    # filters.UpdateType.MESSAGE: don't dispatch on an EDITED command (update.message is None for an
+    # edit → the cmd_* handlers would AttributeError on update.message.reply_text). New messages only.
+    _new = filters.UpdateType.MESSAGE
+    app.add_handler(CommandHandler("start", cmd_start, filters=_new))
+    app.add_handler(CommandHandler("menu", cmd_menu, filters=_new))
+    app.add_handler(CommandHandler("desktop", cmd_desktop, filters=_new))
+    app.add_handler(CommandHandler("login", cmd_login, filters=_new))
+    app.add_handler(CommandHandler("reset", cmd_reset, filters=_new))
+    app.add_handler(CommandHandler("clear", cmd_clear, filters=_new))
+    app.add_handler(CommandHandler("lang", cmd_lang, filters=_new))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle))  # images Juliano sends
+    # ANY other document (PDF/CSV/code/zip/…). MUST come AFTER the image-document handler: only the
+    # first matching handler in a group runs, so an image-document is consumed above and a non-image
+    # file lands here (previously these matched NO handler and were silently dropped).
+    app.add_handler(MessageHandler(filters.Document.ALL, handle))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    app.add_error_handler(_on_error)
+    return app
+
+
+def main():
+    app = build_app()
+    log.info(
+        "Shimpz gateway up. allowed=%s stt=%s tts=%s",
+        ALLOWED or "(none)",
+        _voice_on,
+        TTS_MODEL,
+    )
+    # drop_pending_updates: on (re)start, ignore the backlog that piled up while we were down —
+    # avoids replaying stale messages and shrinks the window for a 409 getUpdates conflict.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()

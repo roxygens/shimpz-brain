@@ -1,0 +1,140 @@
+#!/opt/venv/bin/python
+"""shimpz-manifest — read / validate / resolve a Shimpz app's `shimpz.app.toml` (the toolchain's query surface).
+
+A thin CLI over `shimpzmanifest` so bash (`shimpz-app`) and the panel can ask the manifest questions without
+reimplementing the parser. Machine output is JSON on stdout; every error is loud on stderr + a non-zero
+exit, so a caller can `set -e` on it.
+
+  shimpz-manifest check <dir>   validate the manifest (exit 0, or 2 + reason on stderr)
+  shimpz-manifest show  <dir>   print the parsed manifest as JSON
+  shimpz-manifest plan  <dir>   resolve deps against the LIVE workspace + registry → JSON
+                             {name, install_order, calls, native, config_keys}
+  shimpz-manifest calls <dir>   print the comma-separated `--calls` value (a bash convenience)
+
+`plan` walks `[needs].apps` transitively (each dep's own manifest in the workspace), returns the
+dependency-FIRST install order for the ones not yet deployed, and the root's `calls`/`native`. Env:
+SHIMPZ_PROJECTS_DIR (default /config/workspace/projects), SHIMPZ_REGISTRY (default /config/workspace/registry).
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ.get("SHIMPZ_LIB", "/opt/shimpz-lib"))
+import shimpzmanifest as nm
+
+PROJECTS = Path(os.environ.get("SHIMPZ_PROJECTS_DIR", "/config/workspace/projects"))
+REGISTRY = Path(os.environ.get("SHIMPZ_REGISTRY", "/config/workspace/registry"))
+
+
+def _die(msg, code=2):
+    print(f"shimpz-manifest: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _load_project(project_dir):
+    p = nm.find(project_dir)
+    if p is None:
+        _die(f"no {nm.MANIFEST_NAME} in {project_dir}")
+    try:
+        return nm.load(p)
+    except nm.ManifestError as e:
+        _die(str(e))
+
+
+def _dep_loader(name):
+    """Load a dependency app's manifest from the workspace (raises ManifestError so resolve() reports it)."""
+    p = nm.find(PROJECTS / name)
+    if p is None:
+        raise nm.ManifestError(
+            f"app dependency {name!r} has no {nm.MANIFEST_NAME} in {PROJECTS / name} — add its repo to the workspace"
+        )
+    return nm.load(p)
+
+
+def _deployed():
+    """App names already registered — a brain-readable 'is it up' signal (one JSON per service)."""
+    if not REGISTRY.is_dir():
+        return frozenset()
+    return frozenset(p.stem for p in REGISTRY.glob("*.json"))
+
+
+def _as_dict(m):
+    return {
+        "name": m.name,
+        "title": m.title,
+        "version": m.version,
+        "summary": m.summary,
+        "needs": {"native": list(m.native), "apps": list(m.apps), "calls": list(m.calls), "egress": list(m.egress)},
+        # the deny-by-default egress allowlist the L2 proxy enforces: declared hosts + pay.shimpz.com if paid.
+        "egress_allow": sorted(nm.effective_egress(m)),
+        "grants": {"consume": list(m.grants_consume), "publish": m.grants_publish, "dns": m.grants_dns},
+        # the ONE fqdn a publish/dns-granted app is pinned to (empty when it holds no such grant) — the
+        # scope guard in shimpz-publish compares against this so the grid convention has a single source.
+        "publish_domain": nm.app_domain(m.name) if (m.grants_publish or m.grants_dns) else "",
+        # [billing] — paid apps are locked to ShimpzPay (pay="shimpzpay"); free apps have pay="".
+        "billing": {
+            "pay": m.billing_pay,
+            "price": m.billing_price,
+            "currency": m.billing_currency,
+            "period": m.billing_period,
+        },
+        "provides": {"skill": m.provides_skill},
+        "run": [{"name": s.name, "port": s.port, "command": list(s.command)} for s in m.run],
+        "config": {c.key: {"default": c.default, "secret": c.secret, "help": c.help} for c in m.config},
+    }
+
+
+def cmd_check(d):
+    _load_project(d)
+    print("ok")
+
+
+def cmd_show(d):
+    print(json.dumps(_as_dict(_load_project(d)), indent=2))
+
+
+def cmd_plan(d):
+    m = _load_project(d)
+    try:
+        plan = nm.resolve(m, load=_dep_loader, deployed=_deployed())
+    except nm.ManifestError as e:
+        _die(str(e))
+    out = {
+        "name": m.name,
+        "install_order": list(plan.install_order),
+        "calls": list(plan.calls),
+        "native": list(m.native),
+        "egress_allow": sorted(nm.effective_egress(m)),
+        "grants_consume": list(m.grants_consume),
+        "grants_publish": m.grants_publish,
+        "grants_dns": m.grants_dns,
+        "publish_domain": nm.app_domain(m.name) if (m.grants_publish or m.grants_dns) else "",
+        "provides_skill": m.provides_skill,
+        "billing_pay": m.billing_pay,
+        "billing_price": m.billing_price,
+        "billing_currency": m.billing_currency,
+        "billing_period": m.billing_period,
+        "config_keys": sorted(m.config_keys),
+    }
+    print(json.dumps(out, indent=2))
+
+
+def cmd_calls(d):
+    print(",".join(_load_project(d).calls))
+
+
+CMDS = {"check": cmd_check, "show": cmd_show, "plan": cmd_plan, "calls": cmd_calls}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] not in CMDS:
+        _die(f"usage: shimpz-manifest {{{'|'.join(CMDS)}}} <project_dir>")
+    if len(argv) < 3:
+        _die(f"{argv[1]} needs a project dir")
+    CMDS[argv[1]](argv[2])
+
+
+if __name__ == "__main__":
+    main(sys.argv)

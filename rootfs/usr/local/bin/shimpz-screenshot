@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# shimpz-screenshot <url|file.html> <out.png> [width] [height] — screenshot a page at an EXACT viewport.
+#
+# The "SEE" half of the design loop: render your LOCAL build at a real width, LOOK at the PNG,
+# critique it, refine, re-shoot. Uses a SEPARATE throwaway headless Chrome (same pattern as
+# html2pdf-chrome) so it NEVER touches the live, logged-in :9222 browsing session — and gives a
+# clean, deterministic viewport that the on-desktop window (fixed ~1280px) can't. Default 1440x900;
+# pass 390 844 for a phone view (landings live on phones — always check both).
+#
+#   shimpz-app deploy site 3100 -- ...            # serve the build
+#   shimpz-screenshot "http://127.0.0.1:3100/" desktop.png          # then Read desktop.png
+#   shimpz-screenshot "http://127.0.0.1:3100/" mobile.png 390 844   # then Read mobile.png
+set -u
+url="${1:?usage: shimpz-screenshot <url|file.html> <out.png> [width] [height]}"
+out="${2:?usage: shimpz-screenshot <url|file.html> <out.png> [width] [height]}"
+w="${3:-1440}"
+h="${4:-900}"
+# a bare path is treated as a local file
+case "$url" in
+    http://* | https://* | file://*) ;;
+    *) url="file://$(realpath "$url")" ;;
+esac
+# Remove any PRIOR shot at this path FIRST. The design loop re-shoots the same filename each pass; if
+# Chrome fails on pass N (dev server died / crash), a stale pass-(N−1) PNG would otherwise still satisfy
+# `[ -s "$out" ]` and we'd "verify" pixels that never rendered — the exact false-confidence this exists to kill.
+rm -f -- "$out"
+# headless=new in its OWN instance (no --user-data-dir clash with the running Chrome). virtual-time +
+# compositor flags wait for fonts/JS/paint so the shot isn't a half-rendered blank (per html2pdf-chrome).
+# Capture Chrome's stderr so a failure is DIAGNOSABLE (was silenced) — shown only if the shot is missing.
+err="$(google-chrome-stable --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+    --hide-scrollbars --virtual-time-budget=8000 --run-all-compositor-stages-before-draw \
+    --window-size="${w},${h}" --screenshot="$out" "$url" 2>&1 >/dev/null)" || true
+if [ -s "$out" ]; then
+    echo "$out (${w}x${h}) — Read it, then critique against the shimpz-web-design checklist."
+else
+    echo "ERROR: screenshot failed or came out blank — is the URL actually serving?" >&2
+    [ -n "$err" ] && printf '%s\n' "$err" | tail -5 >&2
+    exit 1
+fi

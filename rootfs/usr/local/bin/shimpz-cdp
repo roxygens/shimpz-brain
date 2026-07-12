@@ -1,0 +1,108 @@
+#!/opt/venv/bin/python
+"""shimpz-cdp — read the LIVE page's DOM so you act on GROUND TRUTH, not blind screenshots.
+
+  shimpz-cdp eval '<js-expression>' [url-substring]
+        Evaluate a JS expression in the active page and print its JSON value. Reading, not guessing:
+          shimpz-cdp eval 'document.title'
+          shimpz-cdp eval 'document.querySelectorAll("article").length'
+          shimpz-cdp eval '!!document.querySelector("div[role=dialog]")'   # is a dialog open?
+
+  shimpz-cdp rect '<css-selector>' [url-substring]
+        Find an element and print the DESKTOP coordinates of its centre, ready for uiclick:
+          screen: 812 344            <- feed straight into:  uiclick 812 344
+          viewport: 812 272 (140x36) visible=true
+        Scrolls it into view first. Exits 1 if the selector matches nothing (so a wrong guess FAILS
+        LOUD instead of clicking empty space). This is how you stop the blind-click thrash — ground the
+        click in the DOM, then let uiclick do the human-like motion.
+
+  shimpz-cdp text '<css-selector>' [url-substring]
+        Print an element's innerText (read a label / a result / an error banner deterministically).
+
+Notes: reads the FIRST 'page' target whose url contains [url-substring] (else the first page). This is
+for READING + GROUNDING; the actual click stays with uiclick (human motion, stealth). For a hidden
+file input use chrome-upload; for the raw pixels (overlays/CAPTCHA the DOM hides) use shimpz-shot.
+
+SECURITY_ENGINEERING_PLAN.md item 0: CDP (127.0.0.1:9222) lives in the `shimpz-browser` container now —
+this calls browser-agent's /v1/browser/cdp/eval|rect|text instead of talking to CDP directly.
+"""
+
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ.get("SHIMPZ_LIB", "/opt/shimpz-lib"))
+import shimpzbrowser  # shared browser-agent HTTP client (see /opt/shimpz-lib/shimpzbrowser.py)
+
+
+def _fmt_value(v: object) -> str:
+    """Print a JS value the way a shell caller wants it.
+
+    A bare string/number prints as-is (so it pipes), everything else as compact JSON.
+    """
+    if isinstance(v, str):
+        return v
+    return json.dumps(v, ensure_ascii=False)
+
+
+def cmd_eval(expr: str, url_hint: str | None) -> int:
+    result = shimpzbrowser.call_json("POST", "/v1/browser/cdp/eval", {"js": expr, "url_hint": url_hint})
+    print(_fmt_value(result.get("value")))
+    return 0
+
+
+def _query(path: str, selector: str, url_hint: str | None) -> dict:
+    from urllib.parse import quote
+
+    qs = f"selector={quote(selector)}"
+    if url_hint:
+        qs += f"&url_hint={quote(url_hint)}"
+    return shimpzbrowser.call_json("GET", f"{path}?{qs}")
+
+
+def cmd_rect(selector: str, url_hint: str | None) -> int:
+    try:
+        result = _query("/v1/browser/cdp/rect", selector, url_hint)
+    except shimpzbrowser.BrowserAgentError as exc:
+        if "HTTP 404" in str(exc):
+            print(f"shimpz-cdp: selector matched nothing: {selector}", file=sys.stderr)
+            return 1
+        raise
+    print(f"screen: {result['screen_x']} {result['screen_y']}")
+    visible = str(bool(result["width"] and result["height"])).lower()
+    w, h = result["width"], result["height"]
+    print(f"viewport: {result['viewport_x']} {result['viewport_y']} ({w}x{h}) visible={visible}")
+    return 0
+
+
+def cmd_text(selector: str, url_hint: str | None) -> int:
+    try:
+        result = _query("/v1/browser/cdp/text", selector, url_hint)
+    except shimpzbrowser.BrowserAgentError as exc:
+        if "HTTP 404" in str(exc):
+            print(f"shimpz-cdp: selector matched nothing: {selector}", file=sys.stderr)
+            return 1
+        raise
+    print(result["text"])
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if len(argv) < 2 or argv[0] not in ("eval", "rect", "text"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    op, arg = argv[0], argv[1]
+    url_hint = argv[2] if len(argv) > 2 else None
+    try:
+        if op == "eval":
+            return cmd_eval(arg, url_hint)
+        if op == "rect":
+            return cmd_rect(arg, url_hint)
+        return cmd_text(arg, url_hint)
+    except shimpzbrowser.BrowserAgentError as exc:
+        print(f"shimpz-cdp: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,47 @@
+#!/opt/venv/bin/python
+"""chrome-upload <css-selector> <file> [url-substring].
+
+Attaches a file to a PAGE's <input type="file"> via CDP (DOM.setFileInputFiles) — WITHOUT opening
+the OS native dialog. It's the right, deterministic and cheap way to upload in Chrome: no
+coordinates, no vision, no GTK dialog. It even works with a hidden input (the norm on sites like
+LinkedIn/Twitter, where a styled button triggers a hidden <input type=file>) — you just need the
+input's CSS selector.
+
+  chrome-upload "#avatar" /config/workspace/logo.png
+  chrome-upload "input[type=file]" /config/workspace/foto.jpg linkedin.com
+
+If the input is inside an <iframe> or doesn't exist, it exits !=0 — then fall back to the
+native dialog: click the upload button and run `uiupload <file>`.
+
+SECURITY_ENGINEERING_PLAN.md item 0: CDP lives in the `shimpz-browser` container now — this sends the
+file's BYTES to browser-agent's /v1/browser/upload (mode=dom) instead of talking to CDP directly.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ.get("SHIMPZ_LIB", "/opt/shimpz-lib"))
+import shimpzbrowser  # shared browser-agent HTTP client (see /opt/shimpz-lib/shimpzbrowser.py)
+
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        sys.exit("usage: chrome-upload <css-selector> <file> [url-substring]")
+    selector, path = sys.argv[1], sys.argv[2]
+    url_hint = sys.argv[3] if len(sys.argv) > 3 else None
+    if not Path(path).exists():
+        sys.exit(f"ERROR: file does not exist: {path}")
+
+    body = {"mode": "dom", "filename": Path(path).name, "file_bytes": shimpzbrowser.b64_file(path), "selector": selector}
+    if url_hint:
+        body["url_hint"] = url_hint
+    try:
+        result = shimpzbrowser.call_json("POST", "/v1/browser/upload", body)
+    except shimpzbrowser.BrowserAgentError as exc:
+        sys.exit(f"ERROR: could not attach via CDP ({exc}). If it's a native dialog, use uiupload.")
+    print(f"OK: '{path}' attached ({result['detail']}).")
+
+
+if __name__ == "__main__":
+    main()
