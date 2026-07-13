@@ -1,0 +1,4 @@
+
+# Build artefacts — never committed (keeps the every-turn sync clean)
+__pycache__/
+*.py[cod]
