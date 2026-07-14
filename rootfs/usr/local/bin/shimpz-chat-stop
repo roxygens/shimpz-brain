@@ -274,6 +274,15 @@ def _read_state(path: Path) -> dict[str, int | str] | None:
     return {**state, "container_id": container_id}
 
 
+def _path_entry_exists(path: Path) -> bool:
+    """Check root state without following a symlink or hiding an unexpected lstat failure."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _descendants(root_pid: int, root_starttime: int) -> dict[int, int]:
     if not _same_process(root_pid, root_starttime):
         return {}
@@ -460,14 +469,21 @@ def _request(token: str) -> int:
     try:
         _write_stop(token)
         active = _read_active()
-        if active is not None and active["token"] == token and active["phase"] == "claimed":
+        pid_path = STATE_DIR / f"{token}.pid"
+        if (
+            active is not None
+            and active["token"] == token
+            and active["phase"] == "claimed"
+            and not _path_entry_exists(pid_path)
+        ):
             ACTIVE_PATH.unlink(missing_ok=True)
             early_result = 0
         else:
-            pid_path = STATE_DIR / f"{token}.pid"
             state = _read_state(pid_path)
             if state is None:
-                early_result = 1 if pid_path.exists() or (active is not None and active["token"] == token) else 3
+                early_result = (
+                    1 if _path_entry_exists(pid_path) or (active is not None and active["token"] == token) else 3
+                )
             elif (
                 active is None
                 or active["token"] != token
