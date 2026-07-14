@@ -220,13 +220,16 @@ RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/uv-instal
 # uv.lock binds the complete transitive graph and every registry artifact hash; --frozen makes a
 # dependency edit without a deliberately regenerated lock fail the image build.
 COPY pyproject.toml uv.lock /opt/shimpz-runtime/
-RUN UV_PYTHON_INSTALL_DIR=/opt/uv-python uv python install "${PYTHON_VERSION}" && \
+RUN export UV_CACHE_DIR=/tmp/shimpz-uv-cache UV_LINK_MODE=copy && \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python uv python install "${PYTHON_VERSION}" && \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python uv venv --python "${PYTHON_VERSION}" /opt/venv && \
     UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --project /opt/shimpz-runtime \
         --frozen --no-dev --no-install-project --python /opt/venv/bin/python && \
     /opt/venv/bin/python --version && \
     /opt/venv/bin/python -c 'import confluent_kafka, model2vec, numpy, requests, telegram, trafilatura' && \
-    rm -rf /root/.cache/uv
+    find /opt/uv-python /opt/venv -type f -name '*.pyc' -delete && \
+    /opt/venv/bin/python -m compileall -q -f --invalidation-mode checked-hash /opt/uv-python /opt/venv && \
+    rm -rf "${UV_CACHE_DIR}" /config/.cache/uv
 
 # --- Local semantic-recall embeddings (R121): a small MULTILINGUAL static-embedding model
 # (model2vec — no torch/onnx, py3.14-safe), baked so recall works offline and deterministically.
