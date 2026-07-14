@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# shimpzdetect.sh — helpers shared by the deploy/publish CLIs (shimpz-app, shimpz-publish, shimpz-unpublish,
-# shimpz-db). Sourced as:
+# shimpzdetect.sh — helpers shared by the deploy/publish CLIs (shimpz-app, shimpz-publish, and
+# shimpz-unpublish). Sourced as:
 #
 #     . "${SHIMPZ_LIB:-/opt/shimpz-lib}/shimpzdetect.sh"
 #
@@ -51,8 +51,8 @@ _isbackend(){
 # backend dir → project root (shimpz-new scaffolds the API under <project>/backend/)
 _projroot(){ case "$1" in */backend) dirname "$1" ;; *) printf '%s' "$1" ;; esac; }
 
-# The proj_<name> sanitizer shared by shimpz-db (db/role names) and shimpz-app's DSN gate — they MUST
-# agree, or the gate would demand a database shimpz-db never creates.
+# The canonical proj_<name> sanitizer used by shimpz-app's DSN gate and the server-side drivers. They
+# MUST agree, or the gate would accept a credential outside the app's exact resource namespace.
 _sanitize_proj(){ printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -cs 'a-z0-9_' '_' | sed 's/^_*//;s/_*$//'; }
 
 # NOTE: the old _tunnel_cfg/_zone_for (raw `cf GET` calls + client-side JSON manipulation) were

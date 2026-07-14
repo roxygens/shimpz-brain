@@ -1,9 +1,9 @@
 #!/opt/venv/bin/python
-"""shimpz-new — scaffold a new project in the NON-NEGOTIABLE ecosystem shape, so the standard is GENERATED, not remembered.
+"""Scaffold the non-negotiable ecosystem shape so the standard is generated, not remembered.
 
 One command produces a compliant skeleton that already passes shimpz-stdcheck:
 
-  fullstack : backend/ (FastAPI + SQLAlchemy 2 + alembic + isolated Postgres) + frontend/ (SvelteKit 5
+  fullstack : backend/ (FastAPI + SQLAlchemy 2 + alembic + install-time scoped Postgres) + frontend/ (SvelteKit 5
               + Tailwind v4, talking to the API at a RELATIVE /api/...) + a generated SECRET_KEY.
   api       : backend only.        web : SvelteKit frontend only (static landing, prerendered).
   script    : a minimal uv project (one main.py).
@@ -12,13 +12,13 @@ Design — two phases:
   • SOURCE phase (pure file writes): everything shimpz-stdcheck judges (backend/app/*.py, frontend/src/*)
     plus .gitignore/.env.example/README. No network.
   • TOOLCHAIN phase (real CLIs): `uv sync`, official `sv create`, `pnpm add` (tailwind + adapter-static),
-    `shimpz-db create`, `alembic init`, secret generation into .env. Backend files are hand-written (small,
+    `alembic init`, secret generation into .env. Backend files are hand-written (small,
     stable); the FRONTEND scaffold uses the official `sv` CLI (guaranteed-building) and shimpz-new only
     OVERLAYS the compliant deltas (the /api dev proxy, an example page that fetches /api, Tailwind).
 
 TESTING: there are NO mocks. The pure security/parse functions are tested directly; the toolchain runs
-for real, in the shimpz-brain container, via tests/test-shimpz-new-live.py (it needs node/uv/pnpm/Postgres, which
-exist only there). See [[shimpz-new-live-only-tests]].
+for real in the shimpz-brain container via tests/test-shimpz-new-live.py (node/uv/pnpm run there; scoped
+Postgres checks require an explicit controller-supplied test DSN). See [[shimpz-new-live-only-tests]].
 
 FAIL-FAST: every toolchain step runs with check=True and surfaces loudly — no fallback that masks a
 broken scaffold. Refuses to overwrite an existing project; validates the name against path traversal.
@@ -35,8 +35,8 @@ from pathlib import Path
 
 KINDS = ("fullstack", "api", "web", "script")
 
-# A project name is also a directory name and a Postgres db suffix — keep it a strict slug so it can
-# never escape PROOT (path traversal) or break shimpz-db. Lowercase, dash-separated, ≤40 chars.
+# A project name is also a directory name and a platform identity — keep it a strict slug so it can
+# never escape PROOT (path traversal) or produce an invalid scoped resource name. Lowercase, dash-separated, ≤40 chars.
 # \Z (end-of-STRING), NOT $ — `$` matches before a trailing "\n", so 'demo\n' would slip through and
 # become a newline-bearing directory/db name. \Z forbids that.
 NAME_RE = re.compile(r"[a-z][a-z0-9]*(-[a-z0-9]+)*\Z")
@@ -84,7 +84,8 @@ if not (_SHIMPZBUS_SRC / "pyproject.toml").is_file():
     raise FileNotFoundError(f"shimpzbus source not found at {_SHIMPZBUS_SRC} — cannot scaffold backends")
 
 ENV_EXAMPLE = """\
-# Copy to .env (gitignored) and fill in. shimpz-new generates real values on a real machine.
+# Copy to .env (gitignored) and fill in. Only a trusted platform controller may inject DATABASE_URL.
+# Platform-owned: workspace tooling never provisions or copies a tenant DSN.
 DATABASE_URL=
 SECRET_KEY=
 # Logging is process env (NOT read from .env): LOG_FORMAT=console for human dev output (default json),
@@ -158,8 +159,8 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from app.config import settings
 
 # SQLAlchemy 2.0 + psycopg3 engine (never a raw driver connection in handlers); schema via alembic.
-# shimpz-db emits a bare `postgresql://` DSN, which SQLAlchemy maps to psycopg2 — but this project ships
-# psycopg3. Pin the psycopg3 driver so create_engine imports cleanly.
+# A trusted controller may inject a bare `postgresql://` DSN, which SQLAlchemy maps to psycopg2 — but
+# this project ships psycopg3. Pin the psycopg3 driver so create_engine imports cleanly.
 _url = settings.database_url
 if _url.startswith("postgresql://"):
     _url = "postgresql+psycopg://" + _url[len("postgresql://"):]
@@ -913,24 +914,11 @@ def _run(cmd, cwd):
     subprocess.run(cmd, cwd=cwd, check=True)
 
 
-def _extract_dsn(out):
-    """Pull the DSN from `shimpz-db create` output.
-
-    The ONLY producer is shimpz-db, which prints exactly `DATABASE_URL=<dsn>` — so this is a strict
-    prefix match, not a speculative URL scan (fail-fast doctrine: parse the contract; if the
-    contract breaks, return None so the caller raises loudly instead of guessing at a URL).
-    """
-    for ln in out.splitlines():
-        if ln.startswith("DATABASE_URL="):
-            return ln.removeprefix("DATABASE_URL=")
-    return None
-
-
 def _extract_bus_creds(out):
     """Pull the SASL identity from `shimpz-bus provision` output.
 
     The ONLY producer is shimpz-bus, which prints exactly the 3 `SHIMPZ_BUS_SASL_*=` lines documented in
-    its own `cmd_provision` — same narrow-contract, fail-fast doctrine as `_extract_dsn`: anything
+    its own `cmd_provision` — a narrow, fail-fast contract: anything
     less than all 3 keys returns None so the caller raises instead of deploying with a partial/no
     identity (shimpz-app's own deploy-time allowlist expects exactly these 3 keys, see shimpz-app's
     `_deploy_envjson`).
@@ -955,7 +943,7 @@ def _strip_nested_git(fe):
 
 
 def toolchain(target, name, kind):
-    # Real external execution: node/uv/pnpm/`sv`/Postgres. There are NO mocks anywhere — this is
+    # Real external execution: node/uv/pnpm/`sv`/bus provisioning. There are NO mocks anywhere — this is
     # exercised for real by tests/test-shimpz-new-live.py (SHIMPZ_NEW_LIVE=1) inside the shimpz-brain container,
     # which is the ONLY place these tools exist. No fakes ever stand in for these CLIs.
     if has_backend(kind):
@@ -1000,15 +988,11 @@ def toolchain(target, name, kind):
         )
         write_frontend_deltas(target, name, kind)  # overlay AFTER sv create
         _strip_nested_git(fe)
-    # generated secret + (for backend-with-DB kinds) an isolated Postgres DB → .env (gitignored). Only a
-    # real backend-with-persistence (fullstack/api) gets a DB — a frontend-only landing (web) or a
-    # throwaway script does NOT (the playbook: "No DB unless it persists"; SQLite for throwaway).
+    # Generate local secrets and project bus credentials into .env (gitignored). Database control is
+    # deliberately absent: only a trusted platform controller may create an App-scoped DB and inject
+    # DATABASE_URL. Workspace tooling must never gain a global create/list/query/drop capability.
     secret = secrets.token_urlsafe(48)
     if kind in ("fullstack", "api"):
-        out = subprocess.run(["shimpz-db", "create", name], capture_output=True, text=True, check=True).stdout
-        dsn = _extract_dsn(out)
-        if not dsn:
-            raise RuntimeError(f"shimpz-db create returned no DSN (got {out!r})")
         # every fullstack/api scaffold's app/events.py imports shimpzbus (write_backend, unconditional
         # for these two kinds) — without a provisioned SASL identity here, notify()/shimpzbus.stream()
         # fail loudly against the real SASL-enabled broker the moment the app actually runs.
@@ -1016,15 +1000,13 @@ def toolchain(target, name, kind):
         bus_creds = _extract_bus_creds(bus_out)
         if not bus_creds:
             raise RuntimeError(f"shimpz-bus provision returned no SASL creds (got {bus_out!r})")
-        write_env(target, secret, dsn, bus_creds)
+        write_env(target, secret, bus_creds)
     else:
         write_env(target, secret)
 
 
-def write_env(target, secret, db_url=None, bus_creds=None):
-    lines = [f"DATABASE_URL={db_url}"] if db_url else []
-    if bus_creds:
-        lines += [f"{k}={v}" for k, v in bus_creds.items()]
+def write_env(target, secret, bus_creds=None):
+    lines = [f"{k}={v}" for k, v in bus_creds.items()] if bus_creds else []
     lines += [f"SECRET_KEY={secret}"]
     _write(target / ".env", "\n".join(lines) + "\n")
 
@@ -1093,6 +1075,6 @@ if __name__ == "__main__":
     except subprocess.CalledProcessError as e:
         sys.stderr.write(f"shimpz-new: toolchain step failed ({e}) — scaffold is incomplete, not masking it\n")
         sys.exit(1)
-    except RuntimeError as e:  # e.g. shimpz-db returned no DSN — surface, don't mask
+    except RuntimeError as e:  # e.g. bus provisioning returned partial credentials — surface, don't mask
         sys.stderr.write(f"shimpz-new: {e} — scaffold is incomplete, not masking it\n")
         sys.exit(1)

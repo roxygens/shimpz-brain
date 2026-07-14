@@ -99,4 +99,6 @@ Then tell Juliano the live URL, whether it's public/private, and the port — sh
   its own database/bus.
 - **One app = one container = one Caddy route.** Tear down the DOMAIN with
   **`shimpz-unpublish <fqdn>`** (removes ingress + DNS + route + Access in one go); then `shimpz-app rm <name>`
-  for the container and `shimpz-db drop <name>` for its database. Never leave an orphan ingress rule.
+  for the workspace container. A Capsule/app database is lifecycle-owned by the scoped control plane and
+  is removed only by app uninstall or Capsule destroy. Never leave an orphan ingress rule or manually
+  bypass tenant database ownership.

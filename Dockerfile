@@ -78,12 +78,9 @@ RUN groupadd -g "${SHIMPZ_DRIVER_TOKEN_GID}" shimpzdriver-token && usermod -aG s
 ARG SHIMPZ_CFDRIVER_TOKEN_GID=10003
 RUN groupadd -g "${SHIMPZ_CFDRIVER_TOKEN_GID}" shimpzcfdriver-token && usermod -aG shimpzcfdriver-token abc
 
-# Same pattern again: pg-driver's and bus-driver's own bearer tokens
-# (SECURITY_ENGINEERING_PLAN.md item 2, generalizing item 3's pattern to Postgres/Redpanda) — two
-# more DISTINCT GIDs so every sidecar's token stays unreadable via any other sidecar's group. MUST
-# match drivers/pg/Dockerfile's and drivers/bus/Dockerfile's own groupadd exactly.
-ARG SHIMPZ_PGDRIVER_TOKEN_GID=10004
-RUN groupadd -g "${SHIMPZ_PGDRIVER_TOKEN_GID}" shimpzpgdriver-token && usermod -aG shimpzpgdriver-token abc
+# The platform brain deliberately has no pg-driver group/token. Database provisioning is a
+# capsule-driver control-plane operation and tenant access uses the database's exact scoped role.
+# Bus remains a separate named-operation sidecar for the platform development brain.
 ARG SHIMPZ_BUSDRIVER_TOKEN_GID=10005
 RUN groupadd -g "${SHIMPZ_BUSDRIVER_TOKEN_GID}" shimpzbusdriver-token && usermod -aG shimpzbusdriver-token abc
 
@@ -141,8 +138,6 @@ RUN apt-get update && \
         fonts-noto fonts-noto-color-emoji fonts-liberation fonts-noto-cjk \
         # media / extraction / document toolbelt the agent reaches for
         ripgrep ffmpeg jq lsof \
-        # postgres client (psql/createdb/dropdb) for shimpz-db: one isolated DB per project
-        postgresql-client \
         unzip zip p7zip-full poppler-utils tesseract-ocr pandoc \
         # PROFESSIONAL PDFs: WeasyPrint (HTML/CSS->PDF, no JS = deterministic, never
         # blank) + clean pro fonts (Inter sans, IBM Plex mono). Drives md2pdf/html2pdf.

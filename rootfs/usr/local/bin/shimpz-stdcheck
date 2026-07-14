@@ -215,7 +215,8 @@ SECRET_LITERAL_RE = re.compile(
 RAW_PSYCOPG_RE = re.compile(r"\bpsycopg2?\.connect\s*\(")
 
 # A Postgres URL hardcoded to the SHARED INFRA database `shimpz-brain`. The standard is one ISOLATED DB per
-# project (`proj_<name>`, from `shimpz-db create`) read from .env via pydantic-settings — so a literal
+# project (`proj_<name>`, supplied by the scoped platform controller) read from .env via
+# pydantic-settings — so a literal
 # `.../shimpz-brain` dbname in committed source is the explicit "NEVER use the infra `shimpz-brain` database" violation.
 # We match ONLY a bare `shimpz-brain` dbname (boundary-anchored: end / `?query` / quote / space) so a real
 # `proj_shimpz`, `shimpzshop`, `proj_<x>` dbname does NOT trip, and the URL must be a literal in source —
@@ -237,13 +238,13 @@ CUSTOM_BROKER_RE = re.compile(
     r"|nats|paho|zmq|pulsar)\b"
 )
 
-# A NON-POSTGRES datastore. The standard is an isolated PostgreSQL DB per project (`shimpz-db create` →
-# DATABASE_URL in .env, SQLAlchemy+psycopg); CLAUDE.md allows "SQLite only for throwaway" — so in a
+# A NON-POSTGRES datastore. The standard is an isolated PostgreSQL DB per installed app (platform-injected
+# DATABASE_URL, SQLAlchemy+psycopg); CLAUDE.md allows "SQLite only for throwaway" — so in a
 # SERVICE-shaped context (a backend/ dir, alembic migrations, or a file inside an app/ package) this
 # is a BLOCK, and in a bare script project it stays a WARN (allowed, but flagged so a "throwaway"
 # that grew into a service can't keep its file DB silently). Import-anchored + DSN form. R90 extended
 # the family beyond sqlite/shelve: dbm (stdlib file store), tinydb/duckdb (embedded file DBs),
-# pymongo/motor (Mongo — a parallel, unprovisioned datastore outside shimpz-db's isolation). The \b keeps
+# pymongo/motor (Mongo — a parallel, unprovisioned datastore outside the platform DB boundary). The \b keeps
 # look-alikes silent (motors, dbmodels); json/pickle-on-disk stays out (too FP-prone to gate on).
 SQLITE_IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+(?:sqlite3|aiosqlite|shelve|dbm|tinydb|duckdb|pymongo|motor)\b")
 SQLITE_URL_RE = re.compile(r"\b(?:sqlite(?:\+aiosqlite)?|mongodb(?:\+srv)?)://", re.IGNORECASE)
@@ -500,7 +501,7 @@ def scan_backend_text(rel, text, alembic=False, service=False):
             rel,
             ln,
             "hardcoded connection to the shared infra database `shimpz-brain`",
-            "give the project its own DB (shimpz-db create <name> → proj_<name>); read DATABASE_URL from .env",
+            "install the app through the scoped platform controller; read its injected DATABASE_URL from config",
         )
         for ln in _hits(text, INFRA_DB_URL_RE)
     ]
@@ -525,7 +526,7 @@ def scan_backend_text(rel, text, alembic=False, service=False):
             "a non-PostgreSQL datastore (sqlite/shelve/dbm/tinydb/duckdb/mongo) — the standard is an "
             "isolated PostgreSQL DB per project"
             + (" (this project is a service, not a throwaway)" if sqlite_sev == "BLOCK" else ""),
-            "shimpz-db create <name> → DATABASE_URL in .env (SQLAlchemy 2 + psycopg); file DBs only in a throwaway",
+            "use the platform-injected scoped DATABASE_URL (SQLAlchemy 2 + psycopg); file DBs only in a throwaway",
         )
         for ln in sorted(set(_hits(text, SQLITE_IMPORT_RE)) | set(_hits(text, SQLITE_URL_RE)))
     ]

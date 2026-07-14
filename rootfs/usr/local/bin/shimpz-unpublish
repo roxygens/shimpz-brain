@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # shimpz-unpublish <fqdn> — the inverse of shimpz-publish: fully remove a published domain from the air.
 # Removes the tunnel ingress rule + proxied DNS record(s) + Caddy route + any Cloudflare Access app.
-# Does NOT touch the supervised app or its database — tear those down with `shimpz-app rm <name>` and
-# `shimpz-db drop <name>`.
+# Does NOT touch the supervised workspace app. Remove that container separately with `shimpz-app rm
+# <name>`; Capsule/app database lifecycle belongs exclusively to the scoped control plane.
 #
 # SECURITY_ENGINEERING_PLAN.md item 3: goes through cf-driver (cfdriver.sh) instead of the old
 # permissive `cf` helper — `shimpz-brain` never holds SHIMPZ_CF_TOKEN. Zone resolution, tunnel-ingress
@@ -38,4 +38,4 @@ if out=$(_cfdriver_access_public "$fqdn" 2>&1); then
   [ "$count" -gt 0 ] 2>/dev/null && echo "  OK Access app removed"
 fi
 
-echo "$fqdn unpublished. (app + database untouched — shimpz-app rm / shimpz-db drop to remove those.)"
+echo "$fqdn unpublished. (workspace app untouched — use shimpz-app rm to remove its container.)"

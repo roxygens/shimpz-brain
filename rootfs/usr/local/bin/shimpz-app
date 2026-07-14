@@ -25,7 +25,7 @@ set -euo pipefail
 # interpolated into the driver's URL path and (there) into a container/volume name.
 _valid_name(){ case "$1" in ''|*[!A-Za-z0-9_-]*) echo "shimpz-app: name must be [A-Za-z0-9_-]" >&2; exit 2;; esac; }
 
-# Shared helpers (ONE source of truth with shimpz-publish/shimpz-db): _owner_note, the backend/SvelteKit
+# Shared helpers (ONE source of truth with shimpz-publish): _owner_note, the backend/SvelteKit
 # detection rules (_haspy/_svelte_server_files/_isbackend), _projroot and the proj_<name> sanitizer.
 . "${SHIMPZ_LIB:-/opt/shimpz-lib}/shimpzdetect.sh"
 # shimpz-driver HTTP client (_driver_deploy/_driver_lifecycle/_driver_status/_driver_logs/_driver_health/
@@ -108,7 +108,7 @@ _deploy_secgate(){  # $1=dir $2=name $3=port $4=run-command (kept for log contex
 # scanned) could point at ANOTHER project's proj_<x> or an external host and every gate stayed green —
 # the exact cross-project sharing CLAUDE.md forbids. So at deploy: if the project's .env declares a
 # DATABASE_URL, it must be PostgreSQL, on the local server (the compose `postgres` service), and its
-# database must be THIS project's `proj_<name>` (same sanitizer as shimpz-db). No DATABASE_URL → nothing
+# database must be THIS project's `proj_<name>` (the canonical platform sanitizer). No DATABASE_URL → nothing
 # claimed → skip (a static front / script needs no DB). SHIMPZ_DSNCHECK=0 kill-switches it, owner-notified.
 # (shimpz-driver RE-VALIDATES the same rule server-side before deploying — defense in depth in case
 # this client-side gate is ever bypassed or this script is skipped.)
@@ -125,17 +125,18 @@ _deploy_dsngate(){  # $1=resolved app dir (project root or backend/) $2=project 
   [ -n "$dsn" ] || return 0
   case "$dsn" in postgres://*|postgresql://*|postgresql+*://*) : ;; *)
     echo "shimpz-app: DATABASE_URL in $envf is not PostgreSQL — the standard is an isolated proj_<name>" \
-         "Postgres DB (shimpz-db create $proj)" >&2; exit 2;; esac
+         "Postgres DB supplied by the trusted scoped platform installer" >&2; exit 2;; esac
   rest="${dsn#*://}"; case "$rest" in *@*) hostport="${rest#*@}";; *) hostport="$rest";; esac
   host="${hostport%%[:/]*}"
   case "$hostport" in */*) db="${hostport#*/}"; db="${db%%\?*}";; *) db="";; esac
-  expected="proj_$(_sanitize_proj "$proj")"   # same sanitizer as shimpz-db (shimpzdetect.sh)
+  expected="proj_$(_sanitize_proj "$proj")"   # same canonical sanitizer as the server-side drivers
   case "$host" in postgres|127.0.0.1|localhost) : ;; *)
     echo "shimpz-app: DATABASE_URL in $envf points at host '$host' — project DBs live on the local" \
          "Postgres only (host 'postgres'); an external/foreign DB breaks the isolation standard" >&2; exit 2;; esac
   if [ "$db" != "$expected" ]; then
     echo "shimpz-app: DATABASE_URL in $envf points at database '${db:-<none>}' but this project's isolated DB" \
-         "is '$expected' — cross-project/infra DBs are forbidden (shimpz-db create $proj → put its URL in $envf)" >&2; exit 2
+         "is '$expected' — cross-project/infra DBs are forbidden; only the trusted scoped platform" \
+         "installer may supply this credential (the Brain cannot mint or borrow one)" >&2; exit 2
   fi
   echo "  DSN gate: $expected on local postgres ✓"
 }

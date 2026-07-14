@@ -58,20 +58,18 @@ NEVER trade quality for speed. If it's a case for planning (Opus), the plan must
     contrast), and run its **build → `shimpz-shot` → critique → refine** loop against the real browser until
     the page is genuinely striking. Always raise the level of the design.
 - **Back / API / service → FastAPI + uvicorn** with `uv` (SQLAlchemy 2.0 + psycopg3 + pydantic-settings
-  + alembic; **never** raw `psycopg.connect`). **Isolated database per project → `shimpz-db create <name>`**
-  (creates `proj_<name>`, returns the `DATABASE_URL` for the `.env`); **NEVER** use the infra `shimpz-brain` database,
-  nor share a database between projects. SQLite only for a throwaway script — in anything service-shaped
-  (a `backend/`, alembic, an `app/` package) sqlite/shelve is a BLOCK at the gate, not a choice.
-  To **READ** data from a project's DB (leads, waitlist, any table), use **`shimpz-db query <name> "<SQL>"`**
-  — it runs the query **READ-ONLY through the pg-driver** and returns CSV (e.g.
-  `shimpz-db query salesnator_meta "SELECT * FROM waitlist_signups ORDER BY created_at DESC LIMIT 20"`). Do
-  **NOT** use `shimpz-db psql`, `psycopg`, or try to reach `postgres` directly: the brain has **NO route to
-  postgres** by design (datastore isolation) — a direct connect fails with *"could not translate host name
-  postgres"*, which is the isolation working, **not a bug to fix by touching the network**. `shimpz-db query`
-  is the read path.
+  + alembic; **never** raw `psycopg.connect`). A persisted app gets its own least-privilege Postgres database
+  from the Capsule/app installer, which injects `DATABASE_URL`; **NEVER** use the infra `shimpz-brain`
+  database or share a database between apps/Capsules. `shimpz-new` scaffolds the DB integration but does
+  not create a database or write a live DSN. This platform Brain has no pg-driver bearer or network route
+  and therefore cannot create, list, query, or drop tenant databases. Read business data through the app's
+  authenticated API/named operation; if one does not exist, surface that capability gap for a scoped
+  operator workflow. Never borrow a DSN or reopen the database network. SQLite remains acceptable only for
+  a throwaway script; in anything service-shaped (`backend/`, alembic, or an `app/` package) it is a BLOCK.
 - **Start every project with `shimpz-new <name> [fullstack|api|web|script]`** (default fullstack) — it
   SCAFFOLDS the compliant skeleton for you (the structure below, already `shimpz-stdcheck`-clean): SvelteKit 5 +
-  Tailwind v4, FastAPI + SQLAlchemy 2 + alembic, an isolated `proj_<name>` DB, a generated `SECRET_KEY`, a
+  Tailwind v4, FastAPI + SQLAlchemy 2 + alembic, install-time-compatible DB code (but no DB resource or
+  live `DATABASE_URL`), a generated `SECRET_KEY`, a
   frontend that calls the API at a relative `/api`, and the realtime pair — `app/ws.py` (WebSocket gateway)
   + `app/events.py` (notify) + `src/lib/ws.ts` (reconnecting client at `/ws`). Don't hand-assemble what `shimpz-new` generates — then fill in
   the actual business logic. At the END of every turn the `shimpz-stdgate` hook runs `shimpz-stdcheck` over your
@@ -89,7 +87,8 @@ NEVER trade quality for speed. If it's a case for planning (Opus), the plan must
   of required codes, a broad `exclude`, or a glob per-file-ignores over source all count as weakening —
   editing config never relaxes anything (an exact-path per-file-ignores entry is the one sanctioned exemption).
 - **Organization → each project is self-contained** in `projects/<name>/`: fullstack = `backend/` (FastAPI)
-  + `frontend/` (SvelteKit) + `.env`, its own database. Everything tidy, nothing loose. Canonical structure in the
+  + `frontend/` (SvelteKit) + `.env`, designed for its own install-time scoped database. Everything tidy,
+  nothing loose. Canonical structure in the
   `dev-bootstrap` playbook — follow it to the letter. Database schema via **alembic** (migrations), not `create_all`.
 - **Git → each project is its OWN git repository.** One `git init` per `projects/<name>/` — this is
   automatic: **at the end of every task the `shimpz-stdgate` hook runs `shimpz-project-sync`, versioning and
@@ -116,13 +115,16 @@ NEVER trade quality for speed. If it's a case for planning (Opus), the plan must
   App ports = 3100–3999 (enforced at deploy). **Supervisor confs are GENERATED — never hand-edit one and
   never inject config in the command** (`env DATABASE_URL=... <cmd>` is refused: the project `.env` is the
   ONLY DSN source — a DSN baked into a conf once outlived a rename and silently 500'd every request).
-  **Renaming/moving a project is a DEPLOY event**: re-run `shimpz-app deploy` for each of its apps, update the
-  bus registration, and align the DB name (`shimpz-db`) — stale deploy config is invisible until production breaks.
+  A live `DATABASE_URL` may enter `.env` only through a trusted scoped platform provisioning workflow;
+  this Brain never creates, discovers, or copies one. **Renaming/moving a project is a DEPLOY event**:
+  re-run deployment for each app, update bus registration, and have the control plane provision/reinstall
+  the matching app database — stale deploy config is invisible until production breaks.
   A deploy is DONE only when the app ANSWERS: `shimpz-app deploy` smoke-tests the port after supervising
   (health → 5xx/silent = the deploy FAILED; fix and re-deploy, never shrug it off). **DSN gate at deploy:**
   if the project's `.env` declares a `DATABASE_URL`, it must be PostgreSQL on the local server AND this
   project's own `proj_<name>` database — another project's DB, the infra `shimpz-brain` DB, or an external host
-  ABORTS the deploy (isolation is verified, not assumed; `shimpz-db create <name>` gives you the right URL).
+  ABORTS the deploy. Isolation is verified, not assumed; if no trusted controller supplied the exact DSN,
+  a database-backed workspace deploy is unavailable rather than a reason to mint or borrow a credential.
   **Security gate at deploy:** EVERY backend deploy — anything with a `.py`, OR a
   non-Python server (go.mod/Cargo.toml/deno.json, or a package.json without a SvelteKit config) — is
   threat-modeled by `shimpz-secaudit` (Opus, BOLA/IDOR) BEFORE it's supervised; a non-SAFE verdict asks

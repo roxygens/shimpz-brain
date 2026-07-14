@@ -20,7 +20,7 @@ projects/<name>/         # ← THIS folder is its OWN git repo (one repo per pro
 ├── .git/                # auto: `git init` + auto-commit on every Stop (shimpz-project-sync)
 ├── .gitignore           # excludes .env, node_modules, .venv, builds (auto-seeded if absent)
 ├── README.md            # what it is + how to run
-├── .env                 # secrets incl. DATABASE_URL (gitignored — NEVER committed)
+├── .env                 # local secrets; platform may inject DATABASE_URL (NEVER committed)
 ├── .env.example         # committed, no values
 ├── backend/             # FastAPI + uv  (uv init here, --vcs none: no nested repo)
 │   ├── pyproject.toml
@@ -42,11 +42,14 @@ git -C /config/workspace/projects/<name> remote add origin <url>   # opt in a pr
 ```
 `uv init --vcs none` for the backend (no nested repo); `rm -rf frontend/.git` if a SvelteKit scaffold drops one.
 
-## Isolated database — commands (`shimpz-db`, never the infra `shimpz-brain` DB)
-```bash
-shimpz-db create <name>        # creates proj_<name>, prints its DATABASE_URL → paste into .env
-shimpz-db psql <name>          # psql shell;  shimpz-db list / shimpz-db url <name> / shimpz-db drop <name>
-```
+## Isolated database boundary
+
+`shimpz-new` writes DB-ready code and a blank `DATABASE_URL` example; it does not provision a database or
+write a live DSN. The Capsule/app installer is the only authority that creates the app's least-privilege
+database and injects its credential. This platform Brain has no pg-driver token or network route, so it
+cannot create/list/query/drop tenant databases. Never paste another app's DSN, use the infra database, or
+reopen the route. A DB-backed workspace app is packaging/build work until the trusted control plane installs
+it; a DB-free web/script app may still use the local workspace deploy loop.
 
 ## Standard stack (choose from here — never guess, never raw drivers)
 | Need | Lib |
@@ -73,7 +76,7 @@ class Settings(BaseSettings):
     database_url: str
 settings = Settings()
 ```
-NEVER hardcode. Shared infra creds arrive as env vars — read, don't copy.
+NEVER hardcode. Platform-scoped runtime credentials are injected at install — read them, don't copy them.
 
 ## Security checklist — once the shimpz-ask decision (CLAUDE.md) says "needs auth"
 ```bash
@@ -100,16 +103,16 @@ need=$(shimpz-ask "Does this backend handle private/user data that must be prote
   opaque default 500). Commit `uv.lock` so installs are reproducible.
 
 ## Run + deploy — exact commands (the gates themselves are in CLAUDE.md)
-- **DATABASE_URL for the supervised app:** the infra Postgres DSN is `SHIMPZ_PG_DSN` (used by `shimpz-db`),
-  NOT `DATABASE_URL` — so nothing global shadows your project. The app reads `DATABASE_URL` from its
-  own `.env` (pydantic-settings). For the SUPERVISED process, pass it explicitly so it's bulletproof
-  regardless of CWD/env_file (the DSN is the project's **least-privilege role**, not the superuser, so
-  inlining it here is low-risk):
+- **DATABASE_URL for a supervised app:** never pass a DSN on the command line. A trusted Capsule/app
+  install supplies the exact scoped credential as runtime environment. The platform Brain cannot provision
+  one, and `shimpz-app` deliberately rejects `env DATABASE_URL=...` command overrides. For a DB-free
+  workspace service, deploy without a database override:
   ```bash
-  shimpz-app deploy <name>-api <port> -- env DATABASE_URL="$(shimpz-db url <name>)" \
-      uv run --project backend uvicorn app.main:app --host 127.0.0.1 --port <port> --app-dir backend
+  shimpz-app deploy <name>-api <port> -- \
+      uv run --project backend uvicorn app.main:app --host 0.0.0.0 --port <port> --app-dir backend
   ```
-  Port 3100–3999. (Run `uv run` against the `backend/` project.)
+  Port 3100–3999. A generated DB-backed backend will correctly fail its smoke check until installed by the
+  scoped control plane; do not work around that boundary.
 - **Schema = alembic migrations**, not `Base.metadata.create_all` (dev-only): `uv run alembic init
   alembic`, `alembic revision --autogenerate -m "init"`, `alembic upgrade head` (run on deploy).
 - Frontend: SvelteKit calls the API at a **relative `/api/...`** (never a hardcoded host/port). Build →
@@ -118,7 +121,8 @@ need=$(shimpz-ask "Does this backend handle private/user data that must be prote
   lines land level=error in VictoriaLogs).
 - Expose a fullstack app in ONE shot: **`shimpz-publish <fqdn> <web-port> public <api-port>`** — Caddy
   serves the front and routes `/api/*` → the backend (strip_prefix), so the front's relative `/api`
-  calls just work, local and live. Tear down with **`shimpz-unpublish <fqdn>`** (+ `shimpz-app rm`, `shimpz-db drop`).
+  calls just work, local and live. Tear down the domain with **`shimpz-unpublish <fqdn>`** and remove the
+  workspace container with `shimpz-app rm`; Capsule/app database cleanup belongs to uninstall/destroy.
 - Recurring jobs → a **cron** entry running `uv run …` (self-heals on crash); long-running → `shimpz-app`.
 
 Keep code minimal (ponytail): YAGNI → reuse → stdlib → only then new code. But the STRUCTURE above
