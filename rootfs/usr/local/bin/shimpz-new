@@ -801,16 +801,15 @@ def write_script(target, name):
 
 
 # The ONE declarative file every app ships (shimpzmanifest / docs/build-a-shimpz-app.md). Scaffolded with the
-# app's identity + commented examples of the three dependency kinds, so declaring a dep is a one-liner.
+# app's identity + commented examples of the implemented dependency kinds, so declaring a dep is a one-liner.
 MANIFEST_TOML = """\
 # What this Shimpz app is and what it needs. The toolchain reads this: `shimpz-app deploy` resolves [needs]
-# and the admin marketplace surfaces it. Full spec: docs/build-a-shimpz-app.md.
+# and the internal App inventory uses it. Full spec: docs/build-a-shimpz-app.md.
 name = "{name}"
 title = "{title}"
 summary = ""
 
 [needs]
-# native = ["openai"]          # native integrations that must be ENABLED — see docs for the full list
 # apps   = ["other-app"]       # other Shimpz apps this one needs — installed automatically so you REUSE them
 # calls  = ["other-backend"]   # service APIs to reuse (sync) — wired as declared reach (--calls)
 # egress = ["api.example.com"] # external hosts you may reach — apps have NO internet by default

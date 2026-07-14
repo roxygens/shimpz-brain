@@ -468,7 +468,7 @@ case "$cmd" in
     fi
     # ── manifest pre-flight (the shimpz.app.toml app standard) ─────────────────────────────────────────
     # If the project ships a shimpz.app.toml, its [needs] declares app→app dependencies that must already
-    # be up, native integrations it requires, and service APIs it reuses. Resolve it against the LIVE
+    # be up, service APIs it reuses, and external egress. Resolve it against the LIVE
     # workspace + registry (shimpz-manifest) BEFORE the gates, so a missing dependency fails fast + cheap.
     if [ -f "$proj_dir/shimpz.app.toml" ]; then
       plan=$(shimpz-manifest plan "$proj_dir") || { echo "shimpz-app: $proj_dir/shimpz.app.toml did not resolve (see above)" >&2; exit 2; }
@@ -485,9 +485,6 @@ case "$cmd" in
       # external egress the app declares ([needs].egress) + pay.shimpz.com if paid → effective_egress (L2).
       megress=$(printf '%s' "$plan" | jq -r '.egress_allow | join(",")')
       [ -n "$megress" ] && egress="$megress" && echo "  ↳ manifest egress: $megress" >&2
-      # native integrations the app requires → surfaced now (the driver hard-gate is the next slice).
-      reqnative=$(printf '%s' "$plan" | jq -r '.native | join(", ")')
-      [ -n "$reqnative" ] && echo "  ℹ '$name' requires native integrations enabled: $reqnative (enable them in the admin panel)" >&2
     fi
     root=$(_projroot "$dir")                        # project root, computed ONCE for the root-scanning gates
     _deploy_stdcheck "$root"                        # deterministic standards BEFORE anything goes live

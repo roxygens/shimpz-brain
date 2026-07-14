@@ -8,11 +8,11 @@ exit, so a caller can `set -e` on it.
   shimpz-manifest check <dir>   validate the manifest (exit 0, or 2 + reason on stderr)
   shimpz-manifest show  <dir>   print the parsed manifest as JSON
   shimpz-manifest plan  <dir>   resolve deps against the LIVE workspace + registry → JSON
-                             {name, install_order, calls, native, config_keys}
+                             {name, install_order, calls, config_keys}
   shimpz-manifest calls <dir>   print the comma-separated `--calls` value (a bash convenience)
 
 `plan` walks `[needs].apps` transitively (each dep's own manifest in the workspace), returns the
-dependency-FIRST install order for the ones not yet deployed, and the root's `calls`/`native`. Env:
+dependency-FIRST install order for the ones not yet deployed, and the root's `calls`. Env:
 SHIMPZ_PROJECTS_DIR (default /config/workspace/projects), SHIMPZ_REGISTRY (default /config/workspace/registry).
 """
 
@@ -66,7 +66,7 @@ def _as_dict(m):
         "title": m.title,
         "version": m.version,
         "summary": m.summary,
-        "needs": {"native": list(m.native), "apps": list(m.apps), "calls": list(m.calls), "egress": list(m.egress)},
+        "needs": {"apps": list(m.apps), "calls": list(m.calls), "egress": list(m.egress)},
         # the deny-by-default egress allowlist the L2 proxy enforces: declared hosts + pay.shimpz.com if paid.
         "egress_allow": sorted(nm.effective_egress(m)),
         "grants": {"consume": list(m.grants_consume), "publish": m.grants_publish, "dns": m.grants_dns},
@@ -105,7 +105,6 @@ def cmd_plan(d):
         "name": m.name,
         "install_order": list(plan.install_order),
         "calls": list(plan.calls),
-        "native": list(m.native),
         "egress_allow": sorted(nm.effective_egress(m)),
         "grants_consume": list(m.grants_consume),
         "grants_publish": m.grants_publish,

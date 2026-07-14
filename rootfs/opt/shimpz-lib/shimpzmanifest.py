@@ -1,19 +1,18 @@
 """shimpzmanifest — the Shimpz app manifest (`shimpz.app.toml`): parse, validate, normalise.
 
 ONE declarative file per app, at the project root. It states what the app IS (name/title/summary) and
-what it NEEDS: native integrations that must be enabled, other Shimpz apps it depends on, and service APIs
-it reuses. The toolchain reads it HERE (shimpz-new writes it, shimpz-app resolves it, the panel surfaces it) so
-a developer declares everything in one place and the EXISTING machinery is driven from it — never a
-parallel system:
+what it NEEDS: other workspace Apps it depends on, service APIs it reuses, and explicit internet egress.
+The toolchain reads it HERE (shimpz-new writes it and shimpz-app resolves it) so a developer declares the
+implemented contract in one place and the existing machinery is driven from it — never a parallel system:
 
-    [needs].native  → checked against the marketplace enable-state (integrations.json / .env)
     [needs].apps    → app→app dependency: install the app if missing (the one net-new primitive)
     [needs].calls   → compiles straight into `shimpz-app deploy --calls` (sync reach, R128)
+    [needs].egress  → compiles into the deny-by-default external-host allowlist
     [config]        → the app's OWN env keys, an app-scoped allowlist on top of the infra keys
 
-This module is a stateless leaf (stdlib `tomllib` only) so shimpz-app, shimpz-new and the admin panel can all
-import it without pulling in each other's plane. It validates SHAPE and NAMING; a resolver with live
-access (shimpz-app) validates SEMANTICS (is that native integration actually enabled, is that app deployed).
+This module is a stateless leaf (stdlib `tomllib` only) so App tooling can import it without pulling in
+another plane. It validates shape and naming; the workspace resolver validates whether declared App
+dependencies are deployed. Native integration grants are not part of the workspace App contract.
 """
 
 import re
@@ -45,11 +44,7 @@ CURRENCY_RE = re.compile(r"[a-z]{3}\Z")
 # A [needs].egress host — a lowercase DNS hostname the app declares it may reach (deny-by-default egress).
 EGRESS_HOST_RE = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+\Z")
 
-# Native integrations an app may depend on — the marketplace CAPABILITY groups.
-# MIRROR of apps/admin/backend/catalog.py's CAPABILITY-category groups (drift-locked in the test).
-NATIVE_GROUPS = frozenset({"openai", "storage-r2", "cloudflare", "github", "proxy", "extra-models", "shimpzpay"})
-
-# The marketplace publish namespace: an app that requests a publish/dns grant is PINNED to this subdomain
+# The scoped publish namespace: an app that requests a publish/dns grant is PINNED to this subdomain
 # under its own name — <name>.grid.shimpz.com — and nothing else (the enforced scope of the grant).
 GRID_SUFFIX = "grid.shimpz.com"
 
@@ -70,7 +65,7 @@ RESERVED_CONFIG_KEYS = frozenset(
 
 # Global secrets an app must NEVER redeclare as its own config (mirror of the non-`SHIMPZ_` entries in
 # drivers/apps/validate.py::FORBIDDEN_ENV_KEYS; the `SHIMPZ_`-prefixed ones are already refused). An
-# app REQUESTS a capability with [needs].native and lets Shimpz hold the secret — it never carries one.
+# workspace App cannot request or carry these platform credentials.
 FORBIDDEN_CONFIG_KEYS = frozenset(
     {
         "ANTHROPIC_API_KEY",
@@ -89,10 +84,23 @@ FORBIDDEN_CONFIG_KEYS = frozenset(
 # processors' credential env-var names. Kept in sync with shimpz-app's _FORBIDDEN_PAYMENT_ENV_KEYS.
 PAYMENT_KEYS = frozenset(
     {
-        "STRIPE_API_KEY", "STRIPE_SECRET_KEY", "STRIPE_PUBLISHABLE_KEY", "STRIPE_WEBHOOK_SECRET",
-        "STRIPE_RESTRICTED_KEY", "PAYPAL_CLIENT_ID", "PAYPAL_CLIENT_SECRET", "PAYPAL_SECRET",
-        "BRAINTREE_PRIVATE_KEY", "ADYEN_API_KEY", "RAZORPAY_KEY_SECRET", "MERCADOPAGO_ACCESS_TOKEN",
-        "PAGARME_API_KEY", "MOLLIE_API_KEY", "PADDLE_API_KEY", "LEMONSQUEEZY_API_KEY", "SQUARE_ACCESS_TOKEN",
+        "STRIPE_API_KEY",
+        "STRIPE_SECRET_KEY",
+        "STRIPE_PUBLISHABLE_KEY",
+        "STRIPE_WEBHOOK_SECRET",
+        "STRIPE_RESTRICTED_KEY",
+        "PAYPAL_CLIENT_ID",
+        "PAYPAL_CLIENT_SECRET",
+        "PAYPAL_SECRET",
+        "BRAINTREE_PRIVATE_KEY",
+        "ADYEN_API_KEY",
+        "RAZORPAY_KEY_SECRET",
+        "MERCADOPAGO_ACCESS_TOKEN",
+        "PAGARME_API_KEY",
+        "MOLLIE_API_KEY",
+        "PADDLE_API_KEY",
+        "LEMONSQUEEZY_API_KEY",
+        "SQUARE_ACCESS_TOKEN",
     }
 )
 
@@ -103,17 +111,29 @@ PAY_HOST = "pay.shimpz.com"
 # (PAY_HOST is included so it can't be named directly either; a paid app reaches it via [billing].)
 PAYMENT_HOSTS = frozenset(
     {
-        "api.stripe.com", "js.stripe.com", "checkout.stripe.com", "api.paypal.com", "api-m.paypal.com",
-        "api.braintreegateway.com", "api.adyen.com", "checkout.adyen.com", "api.razorpay.com",
-        "api.mercadopago.com", "api.pagar.me", "api.mollie.com", "api.paddle.com", "api.lemonsqueezy.com",
-        "connect.squareup.com", PAY_HOST,
+        "api.stripe.com",
+        "js.stripe.com",
+        "checkout.stripe.com",
+        "api.paypal.com",
+        "api-m.paypal.com",
+        "api.braintreegateway.com",
+        "api.adyen.com",
+        "checkout.adyen.com",
+        "api.razorpay.com",
+        "api.mercadopago.com",
+        "api.pagar.me",
+        "api.mollie.com",
+        "api.paddle.com",
+        "api.lemonsqueezy.com",
+        "connect.squareup.com",
+        PAY_HOST,
     }
 )
 
 _TOP_KEYS = frozenset(
     {"name", "title", "version", "summary", "needs", "grants", "provides", "billing", "run", "config"}
 )
-_NEEDS_KEYS = frozenset({"native", "apps", "calls", "egress"})
+_NEEDS_KEYS = frozenset({"apps", "calls", "egress"})
 _PROVIDES_KEYS = frozenset({"skill"})
 _RUN_ITEM_KEYS = frozenset({"name", "port", "command"})
 # The permissions an app may request. CORE RULE: only grants that are ACTUALLY ENFORCED live here — a
@@ -162,7 +182,6 @@ class Manifest:
     title: str
     version: str
     summary: str
-    native: tuple[str, ...] = ()
     apps: tuple[str, ...] = ()
     calls: tuple[str, ...] = ()
     egress: tuple[str, ...] = ()  # [needs].egress — external hosts the app may reach (deny-by-default allowlist)
@@ -185,27 +204,14 @@ class Manifest:
 
 @dataclass(frozen=True)
 class Plan:
-    """The deploy plan for ONE app: what to install first, what to wire, what's blocking.
+    """The deploy plan for one workspace App: what to install first and what to wire.
 
     `install_order` = the app→app dependencies that aren't deployed yet, dependency-FIRST (topological)
     so each is up before whatever needs it. `calls` = the app's own sync reach (→ `--calls`).
-    `missing_native` = required native integrations that aren't enabled — a hard block on the deploy.
     """
 
     install_order: tuple[str, ...]
     calls: tuple[str, ...]
-    missing_native: tuple[str, ...]
-
-    @property
-    def ready(self) -> bool:
-        """True when nothing blocks the deploy (every required native is enabled; deps get installed)."""
-        return not self.missing_native
-
-
-def missing_native(m: Manifest, enabled) -> tuple[str, ...]:
-    """The manifest's required native integrations that are NOT in `enabled` (order-preserving)."""
-    have = frozenset(enabled)
-    return tuple(g for g in m.native if g not in have)
 
 
 def app_domain(name: str) -> str:
@@ -238,13 +244,12 @@ def publish_scope_ok(name: str, fqdn: str, m: Manifest) -> bool:
     return fqdn == app_domain(name)
 
 
-def resolve(root: Manifest, *, load, deployed, enabled=frozenset()) -> Plan:
-    """Plan `root`'s deploy: topological install-order for its app-deps + the deploy blockers.
+def resolve(root: Manifest, *, load, deployed) -> Plan:
+    """Plan `root`'s deploy: topological install order for its workspace App dependencies.
 
     `load(app_name) -> Manifest` fetches a dependency app's manifest (from the workspace); `deployed` is
-    the set of already-running app names; `enabled` is the set of enabled native integrations. Missing
-    app-deps come out dependency-FIRST (transitive); a dependency cycle raises ManifestError. The native
-    and call checks are the ROOT's own — each dep re-resolves its own needs when it deploys.
+    the set of already-running app names. Missing App dependencies come out dependency-FIRST (transitive);
+    a dependency cycle raises ManifestError. Calls are the root's own declared sync reach.
     """
     deployed = frozenset(deployed)
     order: list[str] = []
@@ -265,7 +270,7 @@ def resolve(root: Manifest, *, load, deployed, enabled=frozenset()) -> Plan:
 
     for dep in root.apps:
         visit(dep)
-    return Plan(tuple(order), root.calls, missing_native(root, enabled))
+    return Plan(tuple(order), root.calls)
 
 
 def find(project_dir) -> Path | None:
@@ -309,10 +314,6 @@ def _from_toml(raw: bytes, where: str) -> Manifest:
         raise ManifestError(f"{where}: [needs] must be a table")
     _reject_unknown(needs, _NEEDS_KEYS, where, "[needs]")
 
-    native = _str_list(needs, "native", where)
-    for g in native:
-        if g not in NATIVE_GROUPS:
-            raise ManifestError(f"{where}: needs.native has unknown integration {g!r} — one of {sorted(NATIVE_GROUPS)}")
     apps = _dedup(_slug_list(needs, "apps", where, NAME_RE, name))
     calls = _dedup(_slug_list(needs, "calls", where, CALL_RE, name))
     egress = _egress(needs, where)
@@ -323,9 +324,23 @@ def _from_toml(raw: bytes, where: str) -> Manifest:
     run = _run(data.get("run", []), where)
     config = _config(data.get("config", {}), where)
     return Manifest(
-        name, title, version, summary, tuple(native), apps, calls, egress, provides_skill,
-        grants_consume, grants_publish, grants_dns,
-        billing_pay, billing_price, billing_currency, billing_period, run, config
+        name,
+        title,
+        version,
+        summary,
+        apps,
+        calls,
+        egress,
+        provides_skill,
+        grants_consume,
+        grants_publish,
+        grants_dns,
+        billing_pay,
+        billing_price,
+        billing_currency,
+        billing_period,
+        run,
+        config,
     )
 
 
@@ -369,7 +384,7 @@ def _own_grant(raw, key, where) -> bool:
         return False
     v = raw[key]
     if v != "own":
-        raise ManifestError(f"{where}: grants.{key} must be \"own\" (its own <name>.{GRID_SUFFIX}); got {v!r}")
+        raise ManifestError(f'{where}: grants.{key} must be "own" (its own <name>.{GRID_SUFFIX}); got {v!r}')
     return True
 
 
@@ -471,8 +486,7 @@ def _config(raw, where) -> tuple[ConfigItem, ...]:
             raise ManifestError(f"{where}: config key {key!r} — the SHIMPZ_ prefix is reserved for Shimpz itself")
         if key in FORBIDDEN_CONFIG_KEYS:
             raise ManifestError(
-                f"{where}: config key {key!r} is a Shimpz-managed secret — request the capability with "
-                f"[needs].native instead of carrying the secret yourself"
+                f"{where}: config key {key!r} is a platform-managed secret outside the workspace App contract"
             )
         if key in PAYMENT_KEYS:
             raise ManifestError(
