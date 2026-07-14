@@ -22,15 +22,8 @@ gpasswd -d abc sudo 2>/dev/null || true
 gpasswd -d abc docker 2>/dev/null || true
 sed -i 's/^%sudo/# shimpz-disabled: %sudo/' /etc/sudoers 2>/dev/null || true
 
-# Always refresh the desktop autostart from the image — /config is a persistent
-# bind-mount, so an older copy would otherwise stay pinned across image updates.
-if [ -f /defaults/autostart ]; then
-    mkdir -p /config/.config/openbox
-    cp /defaults/autostart /config/.config/openbox/autostart
-    chmod +x /config/.config/openbox/autostart
-    chown -R "${PUID:-1000}:${PGID:-1000}" /config/.config/openbox
-    echo "[shimpz-init] refreshed openbox autostart"
-fi
+# The image-owned `/defaults/autostart` is launched directly by svc-shimpz-headless. It is never copied
+# into persistent /config, so an old openbox session file cannot pin startup logic across upgrades.
 
 # Profile .env carries the secrets Shimpz + the helper CLIs read. Idempotent UPSERT from the
 # container environment — a one-shot seed wouldn't propagate keys added after first boot,

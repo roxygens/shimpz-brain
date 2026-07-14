@@ -1,32 +1,70 @@
 #!/usr/bin/with-contenv bash
-# NOTE: openbox launches this via `sh <file>`, so the shebang is ignored and the
-# body must be POSIX-sh safe (no `set -o pipefail`, no bashisms). Container env
-# (TELEGRAM_BOT_TOKEN, SHIMPZ_HOME, …) is inherited from the KasmVNC service.
-#
-# SECURITY_ENGINEERING_PLAN.md item 0: Chrome/the desktop/XTEST/CDP moved entirely to the
-# `shimpz-browser` container — this is now JUST the brain's own startup (the Shimpz gateway, plus the
-# legacy Caddy/supervisord blocks below). The base image's own Xvnc/openbox/kclient still exist and
-# still trigger this script (untouched — see the main Dockerfile's own note on why), but there's
-# nothing left for the desktop to actually show; the gateway runs headless regardless.
+# shellcheck shell=bash  # s6-overlay's `with-contenv` wrapper is not a shell ShellCheck recognizes.
+# Explicit s6 longrun for the platform Brain's headless gateway/installer/app supervisors. The
+# inherited desktop/openbox chain is disabled in the Brain image; shimpz-browser owns it. Capsule
+# Brains deliberately take the inert branch below, because Apps share their core network and must not
+# gain a listening surface on the Brain. Bash is intentional for child supervision and clean shutdown.
+set -euo pipefail
+
+if [[ -n "${SHIMPZ_CAPSULE_ID:-}" ]]; then
+    exec sleep infinity
+fi
 
 SHIMPZ_HOME="${SHIMPZ_HOME:-/config/.shimpz}"
 mkdir -p "$SHIMPZ_HOME" "$SHIMPZ_HOME/logs" 2>/dev/null
+touch "$SHIMPZ_HOME/.headless-autostart-ready"
 
-# Node 24 for Shimpz's code lives in /opt/node24 (NOT in the system PATH, so KasmVNC's kclient keeps
-# the base Node 20 it needs — see the Dockerfile). Put it on PATH here so the Shimpz gateway and every
-# command it runs (pnpm/node for SvelteKit) get Node 24. This is the openbox session only; the
-# kclient s6 service has its own env and stays on the system Node.
+# Node 24 for Shimpz's code lives in /opt/node24. Put it on PATH for the headless gateway and every
+# command it runs (pnpm/node for SvelteKit).
 export PATH="/opt/node24/bin:$PATH"
+
+declare -a supervisors=()
+
+supervise() {
+    local workdir="$1" logfile="$2" child=""
+    shift 2
+    stop_child() {
+        if [[ -n "$child" ]]; then
+            kill "$child" 2>/dev/null || true
+            wait "$child" 2>/dev/null || true
+        fi
+        exit 0
+    }
+    trap stop_child TERM INT
+    while true; do
+        (cd "$workdir" && exec "$@") >>"$logfile" 2>&1 &
+        child=$!
+        wait "$child" || true
+        child=""
+        sleep 3 &
+        child=$!
+        wait "$child" || true
+        child=""
+    done
+}
+
+start_supervised() {
+    supervise "$@" &
+    supervisors+=("$!")
+}
+
+stop_supervisors() {
+    trap - TERM INT
+    if ((${#supervisors[@]})); then
+        kill "${supervisors[@]}" 2>/dev/null || true
+        wait "${supervisors[@]}" 2>/dev/null || true
+    fi
+    exit 0
+}
+
+trap stop_supervisors TERM INT
 
 # --- Shimpz gateway — HEADLESS Telegram bot (voice + text) that drives the Claude Code
 # brain. Launched only when a bot token is set AND the gateway is present (it's added in
 # the Shimpz build phase). Logs → gateway.log. Supervised respawn so a crash self-heals.
 GATEWAY="/usr/local/bin/shimpz-gateway"
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -x "$GATEWAY" ]; then
-    ( while true; do
-        ( cd "$SHIMPZ_HOME" && exec "$GATEWAY" ) >> "$SHIMPZ_HOME/logs/gateway.log" 2>&1
-        sleep 3
-      done ) &
+    start_supervised "$SHIMPZ_HOME" "$SHIMPZ_HOME/logs/gateway.log" "$GATEWAY"
 fi
 
 # --- Shimpz installer — consumes the store's 'Install' bus requests and installs the app, gated by
@@ -34,28 +72,24 @@ fi
 # bot token is set (approval needs Telegram) AND the installer is present. Supervised respawn (self-heal).
 INSTALLER="/usr/local/bin/shimpz-installer"
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -x "$INSTALLER" ]; then
-    ( while true; do
-        ( cd "$SHIMPZ_HOME" && exec "$INSTALLER" ) >> "$SHIMPZ_HOME/logs/shimpz-installer.log" 2>&1
-        sleep 3
-      done ) &
+    start_supervised "$SHIMPZ_HOME" "$SHIMPZ_HOME/logs/shimpz-installer.log" "$INSTALLER"
 fi
 
 # --- Caddy (internal reverse proxy) + supervisor (Shimpz's app process manager) ----------
 # Caddy: Host header → local app port, behind the single Cloudflare Tunnel (TLS at the edge →
 # plain HTTP on :8080). supervisord: keeps Shimpz's web apps (one port each) alive. Both run as
-# this desktop user with persistent configs under $SHIMPZ_HOME, supervised respawn (self-heal).
+# the unprivileged Brain user with persistent configs under $SHIMPZ_HOME, supervised respawn (self-heal).
 if [ -x /usr/local/bin/caddy ] && [ -f "$SHIMPZ_HOME/caddy/Caddyfile" ]; then
-    ( while true; do
-        /usr/local/bin/caddy run --config "$SHIMPZ_HOME/caddy/Caddyfile" --adapter caddyfile \
-            >> "$SHIMPZ_HOME/logs/caddy.log" 2>&1
-        sleep 3
-      done ) &
+    start_supervised "$SHIMPZ_HOME" "$SHIMPZ_HOME/logs/caddy.log" \
+        /usr/local/bin/caddy run --config "$SHIMPZ_HOME/caddy/Caddyfile" --adapter caddyfile
 fi
 if command -v supervisord >/dev/null 2>&1 && [ -f "$SHIMPZ_HOME/supervisor/supervisord.conf" ]; then
-    ( while true; do
-        supervisord -n -c "$SHIMPZ_HOME/supervisor/supervisord.conf" >/dev/null 2>&1
-        sleep 3
-      done ) &
+    start_supervised "$SHIMPZ_HOME" /dev/null supervisord -n -c "$SHIMPZ_HOME/supervisor/supervisord.conf"
 fi
 
-# openbox keeps the session/desktop alive after this script exits.
+# Keep the s6 longrun alive even on an unconfigured image. Any configured child is independently
+# supervised above; s6 owns this aggregate service's lifecycle and stop propagation.
+if ((${#supervisors[@]} == 0)); then
+    exec sleep infinity
+fi
+wait "${supervisors[@]}"

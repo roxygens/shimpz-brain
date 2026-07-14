@@ -264,6 +264,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends cron supervisor
 # --- Overlay our s6 services, headless autostart and one-shot init ---
 COPY rootfs/ /
 
+# SECURITY_ENGINEERING_PLAN.md item 0 / ADR-0002: this is a headless Brain, not a desktop container.
+# The pinned base enables these inherited longruns through the active `user` bundle; in particular,
+# svc-kasmvnc listens without authentication on all interfaces. Remove the complete desktop chain,
+# including svc-docker (which depends on svc-de and would pull every listener back into the bundle),
+# and fail the build if an upstream rename would make this hardening silently incomplete. Browser owns
+# its own copy of the base and deliberately keeps these services.
+RUN set -eux; \
+    for service in svc-kasmvnc svc-kclient svc-nginx svc-de svc-pulseaudio svc-docker; do \
+        entry="/etc/s6-overlay/s6-rc.d/user/contents.d/${service}"; \
+        test -e "$entry" || test -L "$entry"; \
+        rm -f "$entry"; \
+        test ! -e "$entry" && test ! -L "$entry"; \
+    done
+
 # Make scripts executable (COPY does not always preserve the bit across hosts). Glob the whole bin
 # dir instead of enumerating every file: everything in /usr/local/bin is a command (must be +x), so a
 # newly added CLI can never be silently forgotten here (the old per-file list dropped the +x bit on
@@ -271,6 +285,7 @@ COPY rootfs/ /
 # don't need +x of their own (chmod follows to the already-+x target).
 RUN chmod +x /usr/local/bin/* \
              /custom-cont-init.d/*.sh \
+             /etc/s6-overlay/s6-rc.d/svc-shimpz-headless/run \
              /defaults/autostart 2>/dev/null || true; \
     # uikey/uitype are the same HTTP-client wrapper as uiclick (branches on argv[0]).
     ln -sf uiclick /usr/local/bin/uikey && \
