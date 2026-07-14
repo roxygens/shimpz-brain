@@ -275,7 +275,9 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
     npm install -g "pnpm@${PNPM_VERSION}" && \
     printf 'export PATH=/opt/node24/bin:$PATH\n' > /etc/profile.d/node24.sh && \
     node --version && pnpm --version && \
-    rm -rf /root/.npm /tmp/node-compile-cache
+    # The LSIO base sets HOME=/config, so npm writes timestamped logs and cache indexes here rather
+    # than under /root. Remove both possible homes plus Node's compile cache in this same layer.
+    rm -rf /config/.npm /root/.npm /tmp/node-compile-cache
 
 # --- Deploy/runtime tooling (binaries baked now; WIRED to run in Phase 2): ---
 # cron = scheduled jobs/checks; supervisor = where Shimpz registers app services (one port each);
