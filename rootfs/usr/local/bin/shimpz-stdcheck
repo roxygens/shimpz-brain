@@ -157,7 +157,7 @@ HARDCODED_HOST_RE = re.compile(
 # match a quoted "*" element anywhere inside the [...] (not just as the first element).
 CORS_STAR_RE = re.compile(r"""allow_origins\s*=\s*\[[^\]]*['"]\*['"][^\]]*\]""")
 CORS_CREDS_RE = re.compile(r"allow_credentials\s*=\s*True")
-CORS_REGEX_RE = re.compile(r"""allow_origin_regex\s*=\s*(['"])(.*?)\1""")
+CORS_REGEX_RE = re.compile(r"""allow_origin_regex\s*=\s*(?:[rR])?(['"])(.*?)\1""")
 
 
 def _regex_matches_all(val):
