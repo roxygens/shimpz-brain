@@ -1,0 +1,30 @@
+{
+  "model": "claude-sonnet-5",
+  "autoMemoryDirectory": "/config/.shimpz/memory",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/shimpz-recall",
+            "timeout": 15,
+            "statusMessage": "Recalling this Capsule's memory..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/shimpz-memguard",
+            "timeout": 20
+          }
+        ]
+      }
+    ]
+  }
+}

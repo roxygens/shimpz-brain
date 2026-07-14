@@ -1,5 +1,5 @@
 #!/opt/venv/bin/python
-"""shimpz-ask — ask Juliano a question with preset choices (Telegram buttons) + a "type your own" option.
+"""shimpz-ask — ask the Captain a question with preset choices plus a "type your own" option.
 
 BLOCKS until he answers. Returns the chosen/typed answer on stdout.
 
@@ -21,7 +21,7 @@ import sys
 sys.path.insert(0, "/opt/shimpz-lib")
 import shimpzipc  # single source of truth for the $SHIMPZ_HOME/ipc request/response protocol
 
-ap = argparse.ArgumentParser(prog="shimpz-ask", description="ask Juliano a question via Telegram buttons")
+ap = argparse.ArgumentParser(prog="shimpz-ask", description="ask the Captain a question with preset choices")
 ap.add_argument("question")
 ap.add_argument("options", nargs="*")
 ap.add_argument(
