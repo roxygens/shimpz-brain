@@ -431,6 +431,7 @@ def _purge_token_asks(token: str) -> None:
 def _clear(token: str) -> int:
     guard = _acquire_guard()
     try:
+        active = _discard_previous_lifecycle(_current_init_starttime())
         pid_path = STATE_DIR / f"{token}.pid"
         state = _read_state(pid_path)
         if state is not None and _turn_exists(state, token):
@@ -440,7 +441,6 @@ def _clear(token: str) -> int:
         # that crash/tamper evidence, even when every recorded PID is already extinct.
         if _path_entry_exists(pid_path):
             return 1
-        active = _read_active()
         if active is not None and active["token"] == token:
             if active["phase"] != "claimed" or _lock_is_held():
                 return 1
