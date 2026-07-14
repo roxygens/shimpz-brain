@@ -125,7 +125,7 @@ def stdcheck_blocks(project_dir, timeout=120):
         data = json.loads(r.stdout)
         keys = ("severity", "rule", "file", "line", "message", "fix")
         return [tuple(b[k] for k in keys) for b in data["blocks"]]
-    except Exception as e:  # noqa: BLE001 — fail-open gate: surfaced, must not wedge the turn
+    except Exception as e:
         _degrade(f"shimpz-stdcheck failed for {project_dir}: {e!r} (left UNVALIDATED)", project=Path(project_dir).name)
         return []
 
@@ -678,7 +678,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:  # noqa: BLE001 — fail-open gate: surfaced, must not wedge the turn
+    except Exception as e:
         sys.stderr.write(f"shimpz-stdgate: internal error, failing open to sync: {e!r}\n")
         _notify_owner(f"⚠️ stdgate internal error — failed OPEN to plain commit (no gate this turn): {e!r}")
         _run_sync()  # fail-open: never wedge the loop on a gate bug

@@ -297,7 +297,8 @@ def main(argv):
     target, as_json = shimpzaudit.cli_arg(argv, "usage: shimpz-depaudit <project-or-app-dir> [--json]")
     if target is None:
         return 64
-    root = os.path.abspath(target)  # noqa: PTH100 — must NOT resolve symlinks
+    # absolute() deliberately does not resolve symlinks: the audit reports the caller's selected tree.
+    root = str(Path(target).absolute())
     if not Path(root).is_dir():
         sys.stderr.write(f"shimpz-depaudit: not a directory: {root}\n")
         return 1

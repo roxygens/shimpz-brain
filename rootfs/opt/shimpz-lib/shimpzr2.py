@@ -63,7 +63,7 @@ def upload(local_path: str, filename: str, expire: str | None = None) -> dict:
         if expire:
             conn.putheader("X-R2-Expire", expire)
         conn.endheaders()
-        with open(local_path, "rb") as fh:  # noqa: PTH123 — caller-validated local path
+        with Path(local_path).open("rb") as fh:
             while chunk := fh.read(_CHUNK):
                 conn.send(chunk)
         resp = conn.getresponse()
@@ -100,7 +100,7 @@ def download(key: str, dest_path: str) -> int:
         if resp.status != 200:
             raise _fail(resp, "GET", "/v1/r2/get")
         written = 0
-        with open(dest_path, "wb") as fh:  # noqa: PTH123 — caller-validated local dest
+        with Path(dest_path).open("wb") as fh:
             while chunk := resp.read(_CHUNK):
                 fh.write(chunk)
                 written += len(chunk)

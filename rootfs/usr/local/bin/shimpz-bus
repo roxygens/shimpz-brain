@@ -58,19 +58,19 @@ def _busdriver_token() -> str:
 def _busdriver(method: str, path: str, body: dict | None = None) -> dict:
     """Thin HTTP client for bus-driver.
 
-    Same contract as cfdriver.sh/pgdriver.sh's own client functions (bash), just in Python since
-    shimpz-bus is a Python CLI.
+    Same contract as cfdriver.sh's own client function (bash), just in Python since shimpz-bus is a
+    Python CLI.
     """
     token = _busdriver_token()
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(  # noqa: S310 — SHIMPZ_BUSDRIVER_URL is fixed infra config, never user-controlled
+    req = urllib.request.Request(
         f"{_BUSDRIVER_URL}{path}",
         data=data,
         method=method,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 — see above
+        with urllib.request.urlopen(req, timeout=20) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         try:
@@ -106,11 +106,11 @@ def _alive(http):
         try:
             token = Path(os.environ.get("SHIMPZ_DRIVER_TOKEN_FILE", "/run/shimpz-driver/token")).read_text().strip()
             url = os.environ.get("SHIMPZ_DRIVER_URL", "http://shimpz-driver:7070")
-            req = urllib.request.Request(  # noqa: S310 — fixed internal driver URL, never user input
+            req = urllib.request.Request(
                 f"{url}/v1/apps/{host.removeprefix('app_')}/health",
                 headers={"Authorization": f"Bearer {token}"},
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 return bool(json.loads(resp.read()).get("healthy"))
         except OSError, ValueError, urllib.error.URLError:
             return False
@@ -240,7 +240,9 @@ def cmd_new_worker(a):
     (root / "pyproject.toml").write_text(PYPROJECT % {"name": a.name})
     (root / "register.py").write_text(REGISTER_PY % {"topic": a.topic})
     if not (root / "vendor" / "shimpzbus").is_dir():
-        shutil.copytree(_SHIMPZBUS_SRC, root / "vendor" / "shimpzbus", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copytree(
+            _SHIMPZBUS_SRC, root / "vendor" / "shimpzbus", ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
+        )
     print(
         textwrap.dedent(f"""\
         scaffolded {root}  (consumer of '{a.topic}', retry + dead-letter '{a.topic}.dlq', self-registers)

@@ -206,9 +206,11 @@ def get_db():
 """
 
 MODELS_PY = """\
-from sqlalchemy.orm import Mapped, mapped_column  # noqa: F401
+from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db import Base, PKMixin, TimestampMixin  # noqa: F401
+from app.db import Base, PKMixin, TimestampMixin
+
+__all__ = ["Base", "Mapped", "PKMixin", "TimestampMixin", "mapped_column"]
 
 # Define ORM models here. Example:
 #   class Thing(Base, PKMixin, TimestampMixin):
@@ -846,7 +848,7 @@ def write_manifest(target, name, kind):
     _write(target / "shimpz.app.toml", MANIFEST_TOML.format(name=name, title=title, provides=provides))
 
 
-SKILL_MD = '''\
+SKILL_MD = """\
 ---
 name: {name}
 description: >-
@@ -871,7 +873,7 @@ reimplementation) — the running app already guarantees the functionality and i
 ## Business rules
 
 <!-- AUTHOR: the rules the agent MUST respect when orchestrating this app (limits, approvals, ordering). -->
-'''
+"""
 
 
 def write_skill(target, name, kind):

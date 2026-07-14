@@ -33,7 +33,12 @@ def main() -> None:
     if not Path(path).exists():
         sys.exit(f"ERROR: file does not exist: {path}")
 
-    body = {"mode": "dom", "filename": Path(path).name, "file_bytes": shimpzbrowser.b64_file(path), "selector": selector}
+    body = {
+        "mode": "dom",
+        "filename": Path(path).name,
+        "file_bytes": shimpzbrowser.b64_file(path),
+        "selector": selector,
+    }
     if url_hint:
         body["url_hint"] = url_hint
     try:

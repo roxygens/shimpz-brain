@@ -17,6 +17,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 URL = os.environ.get("SHIMPZ_BROWSERAGENT_URL", "http://shimpz-browser:7074")
 TOKEN_FILE = os.environ.get("SHIMPZ_BROWSERAGENT_TOKEN_FILE", "/run/shimpz-browseragent/token")
@@ -28,7 +29,7 @@ class BrowserAgentError(Exception):
 
 def _token() -> str:
     try:
-        with open(TOKEN_FILE) as fh:  # noqa: PTH123 — a fixed, non-user-supplied infra path
+        with Path(TOKEN_FILE).open() as fh:
             return fh.read().strip()
     except OSError as exc:
         raise BrowserAgentError(f"cannot read browser-agent token ({TOKEN_FILE}): {exc}") from exc
@@ -48,14 +49,14 @@ def call_bytes(method: str, path: str, body: dict | None = None) -> tuple[bytes,
 def _call(method: str, path: str, body: dict | None) -> tuple[bytes, dict]:
     token = _token()
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(  # noqa: S310 — SHIMPZ_BROWSERAGENT_URL is fixed infra config, never user-controlled
+    req = urllib.request.Request(
         f"{URL}{path}",
         data=data,
         method=method,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310 — see above
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read(), dict(resp.headers)
     except urllib.error.HTTPError as exc:
         try:
@@ -68,5 +69,5 @@ def _call(method: str, path: str, body: dict | None) -> tuple[bytes, dict]:
 
 
 def b64_file(path: str) -> str:
-    with open(path, "rb") as fh:  # noqa: PTH123 — caller already validated this is a real local path
+    with Path(path).open("rb") as fh:
         return base64.b64encode(fh.read()).decode()

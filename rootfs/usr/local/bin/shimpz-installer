@@ -52,9 +52,7 @@ def handle_install(event, run=subprocess.run, approve=None, publish=shimpzbus.pu
 
 
 def main():
-    shimpzbus.run_worker(
-        "shimpz.install", handle_install, group="shimpz-installer", publishes=["shimpz.install.done"]
-    )
+    shimpzbus.run_worker("shimpz.install", handle_install, group="shimpz-installer", publishes=["shimpz.install.done"])
 
 
 if __name__ == "__main__":

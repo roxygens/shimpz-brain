@@ -226,7 +226,7 @@ def run_worker(
             for attempt in range(1, retries + 1):
                 try:
                     handler(event)
-                except Exception as e:  # noqa: BLE001 — retry boundary: an arbitrary user handler may raise anything; log + retry/DLQ, never crash the consumer
+                except Exception as e:
                     last_err = e
                     log.warning("handler fail %d/%d: %s", attempt, retries, e)
                     if attempt < retries:

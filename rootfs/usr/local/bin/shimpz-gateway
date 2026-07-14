@@ -804,7 +804,7 @@ async def ipc_watcher(app):
                     # it can't re-deliver — exactly the duplicate we're removing.)
                     log.warning("ipc send failed for %s: %s — requeueing", rid, e)
                     shimpzipc.mark_unsent(req)
-        except Exception as e:  # noqa: BLE001 — ipc_watcher daemon loop must never die
+        except Exception as e:
             log.warning("ipc watcher: %s", e)
         await asyncio.sleep(1)
 
@@ -1580,11 +1580,7 @@ def build_app():
     # (already in place) does the real job of serializing brain RUNS per chat while Stop/approval
     # callbacks flow. (Single event loop → still no true parallelism; the lock covers run ordering.)
     builder = (
-        Application.builder()
-        .token(TOKEN)
-        .concurrent_updates(True)
-        .post_init(_post_init)
-        .post_shutdown(_post_shutdown)
+        Application.builder().token(TOKEN).concurrent_updates(True).post_init(_post_init).post_shutdown(_post_shutdown)
     )
     # SECURITY_ENGINEERING_PLAN.md item 8 — default-deny brain egress. The brain is off `edge`; its only
     # route out is the CONNECT allowlist proxy (HTTPS_PROXY). PTB/httpx env-proxy honoring is version-
