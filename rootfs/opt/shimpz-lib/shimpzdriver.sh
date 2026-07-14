@@ -17,13 +17,18 @@ _driver_token(){
 # prints "method path -> HTTP code: body" to stderr and returns 1, so callers under `set -e`
 # fail loudly instead of silently deploying against a rejected request.
 _driver(){
-  local method="$1" path="$2" body="${3:-}" token raw code resp
+  local method="$1" path="$2" body="${3:-}" token auth_config raw code resp
   token=$(_driver_token) || return 1
+  # Keep both the bearer and request JSON outside curl's argv. The fixed fd/config path and stdin
+  # remain visible, but their contents do not appear in /proc/<curl>/cmdline.
+  auth_config=$(printf 'header = "Authorization: Bearer %s"\n' "$token")
   if [ -n "$body" ]; then
     raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$SHIMPZ_DRIVER_URL$path" \
-      -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d "$body")
+      --config /dev/fd/3 -H 'Content-Type: application/json' --data-binary @- \
+      3<<<"$auth_config" <<<"$body")
   else
-    raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$SHIMPZ_DRIVER_URL$path" -H "Authorization: Bearer $token")
+    raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$SHIMPZ_DRIVER_URL$path" \
+      --config /dev/fd/3 3<<<"$auth_config")
   fi
   code="${raw##*$'\n'}"; resp="${raw%$'\n'*}"
   case "$code" in

@@ -18,13 +18,18 @@ _cfdriver_token(){
 # fail loudly instead of silently continuing past a rejected request. Same contract as
 # shimpzdriver.sh's own _driver() — deliberately identical shape, two independent sidecars.
 _cfdriver(){
-  local method="$1" path="$2" body="${3:-}" token raw code resp
+  local method="$1" path="$2" body="${3:-}" token auth_config raw code resp
   token=$(_cfdriver_token) || return 1
+  # curl reads the bearer from fd 3, never argv. Request JSON likewise travels on stdin: app/domain
+  # metadata and future sensitive fields cannot leak through /proc/<curl>/cmdline.
+  auth_config=$(printf 'header = "Authorization: Bearer %s"\n' "$token")
   if [ -n "$body" ]; then
     raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$SHIMPZ_CFDRIVER_URL$path" \
-      -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d "$body")
+      --config /dev/fd/3 -H 'Content-Type: application/json' --data-binary @- \
+      3<<<"$auth_config" <<<"$body")
   else
-    raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$SHIMPZ_CFDRIVER_URL$path" -H "Authorization: Bearer $token")
+    raw=$(curl -sS -w '\n%{http_code}' -X "$method" "$SHIMPZ_CFDRIVER_URL$path" \
+      --config /dev/fd/3 3<<<"$auth_config")
   fi
   code="${raw##*$'\n'}"; resp="${raw%$'\n'*}"
   case "$code" in
