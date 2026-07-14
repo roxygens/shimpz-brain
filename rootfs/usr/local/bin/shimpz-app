@@ -146,7 +146,7 @@ _deploy_dsngate(){  # $1=resolved app dir (project root or backend/) $2=project 
 # never Cloudflare/GitHub/OpenAI/Telegram/Anthropic tokens. shimpz-driver's env allowlist would also
 # reject any of these server-side (defense in depth), but this catches it deterministically, pre-deploy,
 # naming the exact offending key — before any HTTP round-trip.
-_FORBIDDEN_GLOBAL_ENV_KEYS="SHIMPZ_CF_TOKEN CF_TUNNEL_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY VOICE_TOOLS_OPENAI_KEY GITHUB_TOKEN TELEGRAM_BOT_TOKEN SHIMPZ_PG_DSN"
+_FORBIDDEN_GLOBAL_ENV_KEYS="SHIMPZ_CF_TOKEN CF_TUNNEL_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY SHIMPZ_OPENAI_MEDIA_API_KEY VOICE_TOOLS_OPENAI_KEY GITHUB_TOKEN TELEGRAM_BOT_TOKEN SHIMPZ_PG_DSN"
 _deploy_secretgate(){  # $1=dir $2=root
   local dir="$1" root="$2" envf="" k
   for envf in "$dir/.env" "$root/.env"; do [ -s "$envf" ] && break; envf=""; done  # -s: see _deploy_dsngate's note
