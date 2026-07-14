@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 # check=skip=SecretsUsedInArgOrEnv ; false positive: the *_TOKEN_GID/*_TOKEN_* ARGs here hold numeric group IDs and file paths, never secret values
 #
 # Shimpz — autonomous agent, brain = Claude Code, driven over Telegram (voice + text).
@@ -9,11 +9,12 @@
 # browser-agent's narrow, audited HTTP API (see rootfs/opt/shimpz-lib/shimpzbrowser.py) — it never
 # touches DISPLAY/CDP directly and holds no browser-session credential (IPRoyal proxy, etc).
 #
-# Base is still the LinuxServer KasmVNC image (unchanged from before the split) — its bundled
-# Xvnc/kclient/nginx exist but serve nothing reachable (no EXPOSE, no elevated caps) and are not
-# worth the risk of surgically excising from someone else's s6-rc dependency graph; see the EXPOSE
-# comment near the bottom of this file for the full reasoning.
-FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble
+# Base is still the LinuxServer KasmVNC image for its supervised Ubuntu/userspace foundation. The
+# desktop longruns are explicitly removed from the final Brain's active s6 user bundle below: Docker
+# EXPOSE metadata is not an access-control boundary, and Capsule Apps share a private core bridge with
+# their Brain. The separately built shimpz-browser remains the only image that runs the desktop stack.
+FROM lscr.io/linuxserver/baseimage-kasmvnc:ubuntunoble@sha256:c6d902c207d6e4a66ca41ce36dda549cd58a5bc8d353468b24b0cf780eb528c8 AS shimpz-brain-base
+ARG SOURCE_DATE_EPOCH=0
 
 LABEL org.opencontainers.image.title="shimpz-brain" \
       org.opencontainers.image.description="Shimpz agent — Claude Code brain, driven over Telegram; drives the browser via browser-agent in the separate shimpz-browser container"
@@ -26,8 +27,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # release can never silently change Shimpz's behavior (the #1 thing this project's fail-fast ethos
 # forbids). These are the known-good versions captured from the running container. To upgrade
 # one, bump it here (or pass --build-arg NAME=ver) — never a floating "latest"/"current".
-# NOTE: google-chrome-stable is intentionally NOT pinned — its apt repo keeps only the latest
-# build, and a current Chrome is part of the stealth posture (an old UA is itself a bot tell).
 ARG CLAUDE_VERSION=2.1.196
 ARG PYTHON_VERSION=3.14.6
 ARG UV_VERSION=0.11.25
@@ -36,22 +35,38 @@ ARG RCLONE_VERSION=1.74.3
 ARG CADDY_VERSION=2.11.4
 ARG NODE_VERSION=24.18.0
 ARG PNPM_VERSION=11.9.0
+ARG GOOGLE_CHROME_VERSION=150.0.7871.114-1
+ARG EMBEDDING_MODEL_REVISION=73908c3438cf03b6a01bcb9611d62b23d0726f08
+ARG UBUNTU_SNAPSHOT=20260623T000000Z
 
 # --- SUPPLY-CHAIN INTEGRITY (SECURITY_ENGINEERING_PLAN.md item 8) ------------------------
-# A pinned VERSION alone is reproducibility, not integrity: an installer/artifact URL can serve
-# different bytes for the SAME version tag (or, for claude.ai/install.sh, the URL isn't even
-# version-scoped at all) without anything here noticing. Every download below is verified against
+# A pinned VERSION alone is reproducibility, not integrity: an artifact URL can serve different
+# bytes for the SAME version tag without anything here noticing. Every download below is verified against
 # a SHA256 captured HERE, cross-checked against the vendor's own published checksum file where one
 # exists (confirmed exact match for node/rclone; the rest have no separate checksum artifact to
 # diff against, so the hash captured here IS the baseline — a rebuild that gets different bytes
 # for the SAME version now FAILS LOUD instead of silently running altered code). Bump the hash
 # alongside the version, deliberately, when you bump either.
-ARG CLAUDE_INSTALL_SHA256=b3f79015b54c751440a6488f07b1b64f9088742b9052bc1bd356d13108320d2a
+ARG CLAUDE_BINARY_SHA256=eb933c6dd5534db89b83ba09009d5c0932bd1395f7e3bb0f34ba37eec37bbade
 ARG UV_INSTALL_SHA256=ca2de1bca2913ba30ce88658b6d90a663c627ecac378803aa58084a9adb35a46
 ARG RCLONE_SHA256=dbee7ccd7a5d617e4ed4cd4555c16669b511abfe8d31164f61be35ac9e999bd2
 ARG RUFF_SHA256=df8e74862d4cd4fdac11faf3048789896ff9898a0cacb98497df20d0a1cc7bb4
 ARG NODE_SHA256=55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742
 ARG CADDY_SHA256=527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9
+
+# The KasmVNC base is Ubuntu Noble, not Debian. Replace every inherited APT source (including the
+# unused Docker repository) with Canonical's timestamped Ubuntu archive before any apt-get invocation.
+RUN set -eux; \
+    find /etc/apt/sources.list.d -maxdepth 1 -type f \( -name '*.list' -o -name '*.sources' \) -delete; \
+    printf '%s\n' \
+        "deb https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT} noble main restricted universe multiverse" \
+        "deb https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT} noble-updates main restricted universe multiverse" \
+        "deb https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT} noble-security main restricted universe multiverse" \
+        > /etc/apt/sources.list; \
+    printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99shimpz-snapshot; \
+    test "$(grep -Fc "https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}" /etc/apt/sources.list)" -eq 3; \
+    ! grep -RqsE 'https?://(archive|security)\.ubuntu\.com|https?://download\.docker\.com' \
+        /etc/apt/sources.list /etc/apt/sources.list.d
 
 # This host's IPv6 egress is broken; dual-stack endpoints (Cloudflare R2, npm registry,
 # downloads.rclone.org, …) were resolving to dead IPv6 → TLS handshake failures.
@@ -152,28 +167,34 @@ RUN apt-get update && \
     install -d -m 0755 /etc/apt/keyrings && \
     curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
         | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg && \
-    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
         > /etc/apt/sources.list.d/google-chrome.list && \
-    apt-get update && apt-get install -y --no-install-recommends google-chrome-stable && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get update && apt-get install -y --no-install-recommends \
+        "google-chrome-stable=${GOOGLE_CHROME_VERSION}" && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/lib/apt/periodic/* /var/cache/apt/* /var/cache/fontconfig/* \
+        /var/cache/ldconfig/aux-cache /var/cache/man/* /var/log/apt/* \
+        /var/log/alternatives.log /var/log/dpkg.log
 
-# --- Shimpz's brain: Claude Code CLI (native installer — no npm) baked into the image ---
+# --- Shimpz's brain: Claude Code CLI (standalone binary — no npm) baked into the image ---
 # A standalone binary; runtime config/credentials live in $HOME/.claude (= /config/.claude
 # on the persistent volume). Auth is via your Claude subscription (interactive `claude`
-# login, once) or ANTHROPIC_API_KEY. The gateway (rootfs) drives it headless per message.
-# Pin the brain to a known-good build (install.sh takes the version as $1). The runtime
+# login, once). The gateway (rootfs) drives it headless per message.
+# Pin the brain to a known-good build. The runtime
 # auto-updater is OFF (DISABLE_AUTOUPDATER below) so the pin actually holds — an always-on
 # brain silently updating itself is exactly the drift the fail-fast ethos forbids. Bump the
 # brain deliberately: change CLAUDE_VERSION and rebuild.
-# Downloaded to a file and hash-checked BEFORE execution — never `curl | bash` — this URL isn't
-# even version-scoped, so a pinned CLAUDE_VERSION alone would not catch the installer script
-# itself changing under everyone's feet.
-RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh && \
-    echo "${CLAUDE_INSTALL_SHA256}  /tmp/claude-install.sh" | sha256sum -c - && \
-    HOME=/opt/cc bash /tmp/claude-install.sh "$CLAUDE_VERSION" && \
-    rm -f /tmp/claude-install.sh && \
-    ln -sf /opt/cc/.local/bin/claude /usr/local/bin/claude && \
-    HOME=/tmp claude --version
+# The versioned final binary itself is hash-checked locally. No mutable installer or release metadata
+# participates in the build, and no downloaded bytes execute before their recorded digest passes.
+RUN install -d -m 0755 /opt/cc/.local/bin /opt/cc/.local/share/claude/versions && \
+    curl --proto '=https' --tlsv1.2 -fsSL \
+        "https://downloads.claude.ai/claude-code-releases/${CLAUDE_VERSION}/linux-x64/claude" \
+        -o "/opt/cc/.local/share/claude/versions/${CLAUDE_VERSION}" && \
+    echo "${CLAUDE_BINARY_SHA256}  /opt/cc/.local/share/claude/versions/${CLAUDE_VERSION}" | sha256sum -c - && \
+    chmod 0755 "/opt/cc/.local/share/claude/versions/${CLAUDE_VERSION}" && \
+    ln -s "/opt/cc/.local/share/claude/versions/${CLAUDE_VERSION}" /opt/cc/.local/bin/claude && \
+    ln -s /opt/cc/.local/bin/claude /usr/local/bin/claude && \
+    test "$(HOME=/tmp claude --version)" = "${CLAUDE_VERSION} (Claude Code)"
 ENV DISABLE_AUTOUPDATER=1
 
 # --- uv: the Python package/runtime manager (infra venv below + the CODE SHIMPZ WRITES) ---
@@ -185,6 +206,7 @@ RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/uv-instal
     echo "${UV_INSTALL_SHA256}  /tmp/uv-install.sh" | sha256sum -c - && \
     env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh /tmp/uv-install.sh && \
     rm -f /tmp/uv-install.sh && \
+    rm -rf /root/.cache/uv && \
     uv --version
 
 # --- Tools venv: Python deps the helper CLIs + the Telegram gateway need ---
@@ -193,26 +215,29 @@ RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/uv-instal
 # through openai-driver via shimpzopenai.py — plain http.client, no openai SDK here).
 # The interpreter is a uv-managed CPython ${PYTHON_VERSION} in /opt/uv-python — NOT the distro
 # python3 (noble ships 3.12) — because ALL infra Python in this repo is written to 3.14 idioms.
+# uv.lock binds the complete transitive graph and every registry artifact hash; --frozen makes a
+# dependency edit without a deliberately regenerated lock fail the image build.
+COPY pyproject.toml uv.lock /opt/shimpz-runtime/
 RUN UV_PYTHON_INSTALL_DIR=/opt/uv-python uv python install "${PYTHON_VERSION}" && \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python uv venv --python "${PYTHON_VERSION}" /opt/venv && \
-    uv pip install --python /opt/venv/bin/python --no-cache-dir \
-        trafilatura==2.1.0 requests==2.34.2 \
-        python-telegram-bot==22.8 \
-        confluent-kafka==2.14.2 && \
+    UV_PROJECT_ENVIRONMENT=/opt/venv uv sync --project /opt/shimpz-runtime \
+        --frozen --no-dev --no-install-project --python /opt/venv/bin/python && \
     /opt/venv/bin/python --version && \
-    /opt/venv/bin/python -c 'import trafilatura, telegram, requests, confluent_kafka'
+    /opt/venv/bin/python -c 'import confluent_kafka, model2vec, numpy, requests, telegram, trafilatura' && \
+    rm -rf /root/.cache/uv
 
 # --- Local semantic-recall embeddings (R121): a small MULTILINGUAL static-embedding model
 # (model2vec — no torch/onnx, py3.14-safe), baked so recall works offline and deterministically.
 # The markdown files stay the memory; this model only RANKS them (shimpz-lib/shimpzemb.py, used by the
 # shimpz-recall hook). ~500MB on disk, loads ~3s, embeds the whole store in ~50ms on CPU. Its own
-# layer so package-list churn above doesn't re-download the model. ---
-RUN uv pip install --python /opt/venv/bin/python --no-cache-dir \
-        model2vec==0.8.2 numpy==2.5.1 && \
-    HF_HOME=/tmp/hf /opt/venv/bin/python -c "from model2vec import StaticModel; \
-StaticModel.from_pretrained('minishlab/potion-multilingual-128M').save_pretrained('/opt/shimpz-emb/potion-multilingual-128M')" && \
+# layer so package-list churn above doesn't re-download the model. snapshot_download resolves the
+# full immutable Hugging Face commit recorded above; Model2Vec then loads only that local snapshot. ---
+RUN HF_HOME=/tmp/hf /opt/venv/bin/python -c "from huggingface_hub import snapshot_download; from model2vec import StaticModel; \
+snapshot = snapshot_download(repo_id='minishlab/potion-multilingual-128M', revision='${EMBEDDING_MODEL_REVISION}'); \
+StaticModel.from_pretrained(snapshot).save_pretrained('/opt/shimpz-emb/potion-multilingual-128M')" && \
     rm -rf /tmp/hf && \
     chmod -R a+rX /opt/shimpz-emb && \
+    find /opt/shimpz-emb -depth -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + && \
     /opt/venv/bin/python -c "from model2vec import StaticModel; \
 v = StaticModel.from_pretrained('/opt/shimpz-emb/potion-multilingual-128M').encode(['sanity']); \
 assert v.shape == (1, 256), v.shape" && \
@@ -244,7 +269,8 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
     export PATH=/opt/node24/bin:$PATH && \
     npm install -g "pnpm@${PNPM_VERSION}" && \
     printf 'export PATH=/opt/node24/bin:$PATH\n' > /etc/profile.d/node24.sh && \
-    node --version && pnpm --version
+    node --version && pnpm --version && \
+    rm -rf /root/.npm
 
 # --- Deploy/runtime tooling (binaries baked now; WIRED to run in Phase 2): ---
 # cron = scheduled jobs/checks; supervisor = where Shimpz registers app services (one port each);
@@ -253,7 +279,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends cron supervisor
     curl -4 -fsSL "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" -o /tmp/caddy.tar.gz && \
     echo "${CADDY_SHA256}  /tmp/caddy.tar.gz" | sha256sum -c - && \
     tar -xzf /tmp/caddy.tar.gz -C /tmp caddy && install -m 0755 /tmp/caddy /usr/local/bin/caddy && rm -f /tmp/caddy /tmp/caddy.tar.gz && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/lib/apt/periodic/* /var/cache/apt/* /var/cache/fontconfig/* \
+        /var/cache/ldconfig/aux-cache /var/cache/man/* /var/log/apt/* \
+        /var/log/alternatives.log /var/log/dpkg.log && \
     caddy version
 
 # --- Overlay our s6 services, headless autostart and one-shot init ---
