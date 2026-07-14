@@ -317,8 +317,52 @@ RUN chmod +x /usr/local/bin/* \
     # shimpz-captcha is shimpz-approve in "captcha" mode (branches on argv[0]).
     ln -sf shimpz-approve /usr/local/bin/shimpz-captcha
 
-# SECURITY_ENGINEERING_PLAN.md item 0: no EXPOSE anymore — KasmVNC/Chrome/CDP moved entirely to
-# `shimpz-browser`. The brain serves no HTTP/desktop surface of its own at all; the base image's own
-# bundled Xvnc/kclient/nginx services still exist (untouched, not worth the risk of surgically
-# excising them from someone else's s6-rc dependency graph) but are never published or given the
-# elevated caps they'd need to matter — see docker-compose.yml's `shimpz-brain` service.
+# SECURITY_ENGINEERING_PLAN.md item 0: no EXPOSE and no inherited desktop longruns. KasmVNC, kclient,
+# nginx, the desktop environment and PulseAudio are absent from this image's active s6 user bundle;
+# Chrome/CDP and the human desktop live only in `shimpz-browser`.
+
+# Codex is a target in this SAME immutable build graph, not `FROM shimpz-brain:shimpz-local`.
+# Building this target therefore cannot silently consume a mutable local tag with unrelated bytes.
+FROM shimpz-brain-base AS shimpz-brain-codex
+ARG SOURCE_DATE_EPOCH=0
+
+LABEL org.opencontainers.image.title="shimpz-brain-codex" \
+      org.opencontainers.image.description="Shimpz Capsule brain powered by the pinned OpenAI Codex CLI"
+
+ARG CODEX_VERSION=0.144.3
+ARG CODEX_PACKAGE_SHA256=1c3c1f1f636da56a197ce0b5084d44b86f58f0fb32983278fa55c2544d221af4
+ARG CODEX_TARGET=x86_64-unknown-linux-musl
+
+USER root
+RUN release="/opt/codex/packages/standalone/releases/${CODEX_VERSION}-${CODEX_TARGET}" && \
+    install -d -m 0755 "$release" /opt/codex/packages/standalone && \
+    curl --proto '=https' --tlsv1.2 -fsSL \
+        "https://github.com/openai/codex/releases/download/rust-v${CODEX_VERSION}/codex-package-${CODEX_TARGET}.tar.gz" \
+        -o /tmp/codex-package.tar.gz && \
+    echo "${CODEX_PACKAGE_SHA256}  /tmp/codex-package.tar.gz" | sha256sum -c - && \
+    tar -xzf /tmp/codex-package.tar.gz -C "$release" && \
+    rm -f /tmp/codex-package.tar.gz && \
+    ln -s "$release" /opt/codex/packages/standalone/current && \
+    ln -s /opt/codex/packages/standalone/current/bin/codex /usr/local/bin/codex && \
+    ln -s /opt/codex/packages/standalone/current/bin/codex-code-mode-host \
+        /usr/local/bin/codex-code-mode-host && \
+    test "$(codex --version)" = "codex-cli ${CODEX_VERSION}" && \
+    codex-code-mode-host --help >/dev/null
+
+COPY codex/rootfs/ /
+RUN chmod 0755 \
+        /custom-cont-init.d/11-shimpz-codex-init.sh \
+        /usr/local/bin/shimpz-codex-auth \
+        /usr/local/bin/shimpz-codex-run
+
+ENV PUID=1000 \
+    PGID=1000 \
+    HOME=/config \
+    CODEX_HOME=/config/.codex \
+    SHIMPZ_BRAIN_PROVIDER=codex
+WORKDIR /config/workspace
+
+# Keep the no-target build contract as the flagship Claude Brain. Release/CI selects the Codex
+# target explicitly, while both outputs inherit the exact same content-addressed base stage above.
+FROM shimpz-brain-base AS shimpz-brain
+ARG SOURCE_DATE_EPOCH=0

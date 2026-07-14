@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Named, secret-safe Codex authentication operations. Credential material is accepted only on stdin.
+set -euo pipefail
+umask 077
+
+export HOME="${HOME:-/config}"
+export CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+
+usage() {
+    echo "usage: shimpz-codex-auth status|api-key|oauth-cache|logout" >&2
+    exit 64
+}
+
+[ "$#" -eq 1 ] || usage
+case "${1:-}" in
+    status)
+        # Do not relay Codex's text: a future version may add identity details. Return only the stable,
+        # provider-neutral state the Capsule adapter needs.
+        if state="$(codex login status 2>&1)"; then
+            case "${state,,}" in
+                *"api key"*) auth_type=api_key ;;
+                *) auth_type=oauth ;;
+            esac
+            printf '{"provider":"codex","configured":true,"auth_type":"%s"}\n' "$auth_type"
+        else
+            printf '{"provider":"codex","configured":false,"auth_type":null}\n'
+        fi
+        ;;
+    api-key)
+        [ ! -t 0 ] || { echo "API key must be supplied on stdin" >&2; exit 64; }
+        # This is OpenAI's documented non-interactive login path. Codex reads the key directly from
+        # stdin and persists its cache under CODEX_HOME; it never appears in argv or environment.
+        exec codex login --with-api-key
+        ;;
+    oauth-cache)
+        [ ! -t 0 ] || { echo "OAuth auth.json must be supplied on stdin" >&2; exit 64; }
+        # The official headless fallback is copying auth.json. Validate/bound it and atomically place
+        # it in this Capsule's CODEX_HOME without ever holding it in a shell variable.
+        exec /opt/venv/bin/python3 /opt/shimpz-lib/codex_auth_cache.py "$CODEX_HOME"
+        ;;
+    logout)
+        exec codex logout
+        ;;
+    *) usage ;;
+esac

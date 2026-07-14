@@ -1,0 +1,207 @@
+#!/opt/venv/bin/python
+"""Run Codex with stdin prompts and an explicit Capsule-local thread id."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import os
+import re
+import signal
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import BinaryIO
+
+MAX_PROMPT_BYTES = 128 * 1024
+MAX_OUTPUT_LINE_BYTES = 256 * 1024
+MAX_OUTPUT_BYTES = 2 * 1024 * 1024
+THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+
+
+class ProviderOutputError(ValueError):
+    """Codex violated the bounded JSONL transport contract."""
+
+
+def _thread_path() -> Path:
+    home = Path(os.environ.get("SHIMPZ_HOME", "/config/.shimpz"))
+    return home / "codex-thread-id"
+
+
+def _read_prompt() -> bytes:
+    prompt = sys.stdin.buffer.read(MAX_PROMPT_BYTES + 1)
+    if not prompt or len(prompt) > MAX_PROMPT_BYTES:
+        raise ValueError("prompt must be 1..131072 bytes on stdin")
+    return prompt
+
+
+def _read_thread(path: Path) -> str:
+    try:
+        thread_id = path.read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise ValueError("no saved session") from exc
+    if not THREAD_RE.fullmatch(thread_id):
+        raise ValueError("no saved session")
+    return thread_id
+
+
+def _write_thread(path: Path, thread_id: str) -> None:
+    if not THREAD_RE.fullmatch(thread_id):
+        raise ValueError("provider returned an invalid thread id")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    fd, temporary = tempfile.mkstemp(prefix=".codex-thread-", dir=path.parent)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as output:
+            output.write(thread_id + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _command(session: str, thread_path: Path, model: str) -> list[str]:
+    common = ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json"]
+    if model:
+        common.extend(("--model", model))
+    if session == "resume":
+        return ["/usr/local/bin/codex", "exec", "resume", *common, _read_thread(thread_path), "-"]
+    return ["/usr/local/bin/codex", "exec", *common, "--color", "never", "-"]
+
+
+def _spawn_codex(command: list[str], prompt: bytes) -> tuple[int, BinaryIO]:
+    """Fork the fixed Codex binary; a memfd avoids pipe deadlock while stdout streams."""
+    prompt_fd = os.memfd_create("shimpz-codex-prompt", os.MFD_CLOEXEC)
+    written = 0
+    while written < len(prompt):
+        written += os.write(prompt_fd, prompt[written:])
+    os.lseek(prompt_fd, 0, os.SEEK_SET)
+    parent_stdout, child_stdout = os.pipe()
+    actions = (
+        (os.POSIX_SPAWN_DUP2, prompt_fd, sys.stdin.fileno()),
+        (os.POSIX_SPAWN_DUP2, child_stdout, sys.stdout.fileno()),
+        (os.POSIX_SPAWN_CLOSE, prompt_fd),
+        (os.POSIX_SPAWN_CLOSE, parent_stdout),
+        (os.POSIX_SPAWN_CLOSE, child_stdout),
+    )
+    try:
+        pid = os.posix_spawn(command[0], command, os.environ, file_actions=actions)
+    except OSError:
+        os.close(parent_stdout)
+        raise
+    finally:
+        os.close(prompt_fd)
+        os.close(child_stdout)
+    return pid, os.fdopen(parent_stdout, "rb")
+
+
+def _bounded_lines(provider_output: BinaryIO):
+    buffered = b""
+    total = 0
+    while chunk := provider_output.read1(4096):
+        total += len(chunk)
+        if total > MAX_OUTPUT_BYTES:
+            raise ProviderOutputError("Codex output exceeded its total size limit")
+        buffered += chunk
+        if len(buffered) > MAX_OUTPUT_LINE_BYTES and b"\n" not in buffered:
+            raise ProviderOutputError("Codex output line exceeded its size limit")
+        while b"\n" in buffered:
+            line, buffered = buffered.split(b"\n", 1)
+            if len(line) > MAX_OUTPUT_LINE_BYTES:
+                raise ProviderOutputError("Codex output line exceeded its size limit")
+            yield line + b"\n"
+    if len(buffered) > MAX_OUTPUT_LINE_BYTES:
+        raise ProviderOutputError("Codex output line exceeded its size limit")
+    if buffered:
+        yield buffered
+
+
+def _terminate_child(pid: int) -> int:
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        waited, status = os.waitpid(pid, os.WNOHANG)
+        if waited == pid:
+            return status
+        time.sleep(0.05)
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    return os.waitpid(pid, 0)[1]
+
+
+def _invocation_args(argv: list[str]) -> tuple[str, str, str] | None:
+    if len(argv) not in {3, 5} or argv[1] not in {"new", "resume"} or argv[2] not in {"text", "json"}:
+        return None
+    if len(argv) == 3:
+        return argv[1], argv[2], ""
+    if argv[3] != "--model" or MODEL_RE.fullmatch(argv[4]) is None:
+        return None
+    return argv[1], argv[2], argv[4]
+
+
+def main() -> int:
+    invocation = _invocation_args(sys.argv)
+    if invocation is None:
+        print("usage: shimpz-codex-run new|resume text|json [--model MODEL]", file=sys.stderr)
+        return 64
+    session, output_format, model = invocation
+    try:
+        prompt = _read_prompt()
+        thread_path = _thread_path()
+        command = _command(session, thread_path, model)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 66
+
+    try:
+        pid, provider_output = _spawn_codex(command, prompt)
+    except OSError as exc:
+        print(f"could not start Codex: {exc}", file=sys.stderr)
+        return 70
+    final_message = ""
+    status = None
+    transport_failed = False
+    try:
+        with provider_output:
+            for line in _bounded_lines(provider_output):
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    event = None
+                if isinstance(event, dict) and event.get("type") == "thread.started":
+                    thread_id = event.get("thread_id")
+                    if isinstance(thread_id, str):
+                        _write_thread(thread_path, thread_id)
+                item = event.get("item") if isinstance(event, dict) else None
+                if (
+                    isinstance(item, dict)
+                    and event.get("type") == "item.completed"
+                    and item.get("type") == "agent_message"
+                    and isinstance(item.get("text"), str)
+                ):
+                    final_message = item["text"]
+                if output_format == "json":
+                    sys.stdout.buffer.write(line)
+                    sys.stdout.buffer.flush()
+    except (OSError, ProviderOutputError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        transport_failed = True
+        status = _terminate_child(pid)
+    if status is None:
+        _waited, status = os.waitpid(pid, 0)
+    returncode = os.waitstatus_to_exitcode(status)
+    if transport_failed:
+        return 70
+    if output_format == "text" and final_message:
+        print(final_message)
+    return 128 + abs(returncode) if returncode < 0 else returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
