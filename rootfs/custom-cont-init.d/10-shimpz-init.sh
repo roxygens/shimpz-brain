@@ -7,6 +7,13 @@ set -euo pipefail
 
 NH="${SHIMPZ_HOME:-/config/.shimpz}"
 mkdir -p "$NH" "$NH/logs"
+capsule_mode=0
+[ -n "${SHIMPZ_CAPSULE_ID:-}" ] && capsule_mode=1
+if [ "$capsule_mode" -eq 1 ]; then
+    # Root-only, container-lifecycle chat admission state. It must never live below /config: the
+    # hostile tenant owns that persistent tree and could rename or pre-create any apparent lock.
+    install -d -o root -g root -m 0700 /run/shimpz-chat
+fi
 
 # SECURITY (re-assert the Dockerfile hardening at boot): keep the agent user OUT of `sudo`/`docker`
 # even if a base-image init stage re-adds it. The LSIO base grants `%sudo NOPASSWD: ALL`, so sudo-group

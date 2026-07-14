@@ -9,9 +9,56 @@ write/poll/cleanup loop. SHIMPZ_IPC_DIR overrides the dir so a debug harness can
 import contextlib
 import json
 import os
+import re
+import stat
 import time
 import uuid
 from pathlib import Path
+
+CHAT_TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
+RID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+MAX_PENDING_SCAN_ENTRIES = 64
+MAX_REQUEST_BYTES = 64 * 1024
+
+
+def _open_ipc_dir(ipc_dir):
+    return os.open(ipc_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+
+
+def _read_request_at(directory, name):
+    """Return `(payload, invalid_regular)` without following or blocking on tenant file types."""
+    try:
+        before = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > MAX_REQUEST_BYTES:
+            return None, False
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory,
+        )
+        try:
+            after = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(after.st_mode)
+                or after.st_nlink != 1
+                or after.st_size > MAX_REQUEST_BYTES
+                or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+            ):
+                return None, False
+            raw = os.read(descriptor, MAX_REQUEST_BYTES + 1)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return None, False
+    if len(raw) > MAX_REQUEST_BYTES:
+        return None, False
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("payload is not a JSON object")
+    except ValueError, TypeError, RecursionError:
+        return None, True
+    return payload, False
 
 
 def atomic_write(path, text):
@@ -34,20 +81,47 @@ def pending(ipc_dir):
     ipc_watcher and shimpz-run's autopilot both iterate this instead of re-implementing the glob/parse/
     .bad scaffolding. The caller renders/answers the request, then `mark_sent(req_path)`.
     """
-    for req in sorted(Path(ipc_dir).glob("*.req")):
-        try:
-            payload = json.loads(req.read_text())
-            # Valid JSON that isn't an OBJECT ([], "x", 42) would raise AttributeError at
-            # payload.get() below — INSIDE this generator. The gateway's watcher catches it but
-            # never quarantines the file, so it re-poisons every 1s pass and (glob is sorted)
-            # starves every later-sorting rid forever. Quarantine it like a parse failure.
-            if not isinstance(payload, dict):
-                raise ValueError("payload is not a JSON object")
-        except ValueError, OSError:  # JSONDecodeError is a ValueError
-            with contextlib.suppress(OSError):
-                req.rename(req.with_suffix(".bad"))
-            continue
-        yield (payload.get("id") or req.stem), req, payload
+    try:
+        directory = _open_ipc_dir(ipc_dir)
+    except OSError:
+        return
+    try:
+        names = []
+        with os.scandir(directory) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_PENDING_SCAN_ENTRIES:
+                    break
+                if entry.name.endswith(".req"):
+                    names.append(entry.name)
+        for name in sorted(names):
+            payload, invalid = _read_request_at(directory, name)
+            if payload is None:
+                if invalid:
+                    with contextlib.suppress(OSError):
+                        os.rename(
+                            name,
+                            f"{name[:-4]}.bad",
+                            src_dir_fd=directory,
+                            dst_dir_fd=directory,
+                        )
+                continue
+            req = Path(ipc_dir) / name
+            payload_rid = payload.get("id")
+            rid = payload_rid if isinstance(payload_rid, str) and RID_RE.fullmatch(payload_rid) else req.stem
+            if not RID_RE.fullmatch(rid):
+                continue
+            yield rid, req, payload
+    finally:
+        os.close(directory)
+
+
+def pending_for_chat(ipc_dir, chat_token):
+    """Yield only requests owned by one currently active durable chat token."""
+    if not CHAT_TOKEN_RE.fullmatch(chat_token):
+        return
+    for rid, req, payload in pending(ipc_dir):
+        if payload.get("_chat_token") == chat_token:
+            yield rid, req, payload
 
 
 def answer(ipc_dir, rid, payload):
@@ -62,6 +136,27 @@ def answer(ipc_dir, rid, payload):
         return False
     atomic_write(ipc / f"{rid}.resp", json.dumps(payload))
     return True
+
+
+def answer_for_chat(ipc_dir, rid, payload, chat_token):
+    """Answer only an exact pending request owned by the active durable chat token."""
+    if not CHAT_TOKEN_RE.fullmatch(chat_token) or not RID_RE.fullmatch(rid):
+        return False
+    try:
+        directory = _open_ipc_dir(ipc_dir)
+    except OSError:
+        return False
+    try:
+        request_payload, _invalid = _read_request_at(directory, f"{rid}.req")
+    finally:
+        os.close(directory)
+    if request_payload is None or request_payload.get("_chat_token") != chat_token:
+        return False
+    req = Path(ipc_dir) / f"{rid}.req"
+    wrote = answer(ipc_dir, rid, payload)
+    if wrote:
+        mark_sent(req)
+    return wrote
 
 
 def mark_sent(req_path):
@@ -102,7 +197,9 @@ def request(payload, timeout, key):
     """
     ipc = _ipc_dir()
     rid = uuid.uuid4().hex[:12]
-    atomic_write(ipc / f"{rid}.req", json.dumps({"id": rid, **payload}))
+    chat_token = os.environ.get("SHIMPZ_CHAT_TOKEN", "")
+    token_field = {"_chat_token": chat_token} if CHAT_TOKEN_RE.fullmatch(chat_token) else {}
+    atomic_write(ipc / f"{rid}.req", json.dumps({"id": rid, **token_field, **payload}))
     resp = ipc / f"{rid}.resp"
     responded, value = False, None
     deadline = time.time() + timeout

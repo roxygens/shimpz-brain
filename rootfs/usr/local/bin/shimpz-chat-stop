@@ -1,0 +1,558 @@
+#!/opt/venv/bin/python
+"""Cancel one token-addressed turn and verify its subreaped process tree is extinct."""
+
+from __future__ import annotations
+
+import contextlib
+import ctypes
+import fcntl
+import json
+import os
+import re
+import signal
+import stat
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
+CONTAINER_RE = re.compile(r"^[a-f0-9]{64}$")
+HOME = Path(os.environ.get("SHIMPZ_HOME", "/config/.shimpz"))
+STATE_DIR = Path(os.environ.get("SHIMPZ_CHAT_STATE_DIR", "/run/shimpz-chat"))
+ACTIVE_PATH = STATE_DIR / "active.json"
+LOCK_PATH = STATE_DIR / "active.lock"
+GUARD_PATH = STATE_DIR / "guard.lock"
+IPC_DIR = HOME / "ipc"
+TERM_GRACE_SECONDS = 5.0
+# The wrapper has its own two-second KILL/reap window. Give it one extra second to publish
+# extinction (unlink its state file) before declaring the control path failed.
+KILL_GRACE_SECONDS = 3.0
+POLL_SECONDS = 0.05
+MAX_IPC_BYTES = 64 * 1024
+MAX_IPC_PURGE_ENTRIES = 256
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC.pidfd_open.argtypes = (ctypes.c_int, ctypes.c_uint)
+_LIBC.pidfd_open.restype = ctypes.c_int
+_LIBC.pidfd_send_signal.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint)
+_LIBC.pidfd_send_signal.restype = ctypes.c_int
+
+
+def _ensure_state_dir() -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = STATE_DIR.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise OSError("chat control state directory has unsafe ownership or type")
+    STATE_DIR.chmod(0o700)
+
+
+def _open_lock(path: Path, *, nonblocking: bool) -> int | None:
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        os.close(descriptor)
+        raise OSError("chat control lock has unsafe ownership or type")
+    os.fchmod(descriptor, 0o600)
+    try:
+        operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+        fcntl.flock(descriptor, operation)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def _acquire_guard() -> int:
+    descriptor = _open_lock(GUARD_PATH, nonblocking=False)
+    if descriptor is None:
+        raise OSError("chat control guard could not be acquired")
+    return descriptor
+
+
+def _lock_is_held() -> bool:
+    try:
+        descriptor = _open_lock(LOCK_PATH, nonblocking=True)
+    except FileNotFoundError:
+        return False
+    if descriptor is None:
+        return True
+    os.close(descriptor)
+    return False
+
+
+def _read_active() -> dict[str, str | int] | None:
+    try:
+        descriptor = os.open(ACTIVE_PATH, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            os.close(descriptor)
+            raise OSError("chat active-turn state has unsafe ownership or type")
+        with os.fdopen(descriptor, encoding="ascii") as source:
+            payload = json.load(source)
+        token = str(payload["token"])
+        container_id = str(payload["container_id"])
+        init_starttime = int(payload["container_init_starttime"])
+        phase = str(payload["phase"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise OSError("chat active-turn state is invalid") from exc
+    if (
+        payload.get("version") != 2
+        or not TOKEN_RE.fullmatch(token)
+        or not CONTAINER_RE.fullmatch(container_id)
+        or init_starttime < 1
+        or phase not in {"claimed", "running"}
+    ):
+        raise OSError("chat active-turn state is invalid")
+    return {
+        "version": 2,
+        "token": token,
+        "container_id": container_id,
+        "container_init_starttime": init_starttime,
+        "phase": phase,
+    }
+
+
+def _write_active(token: str, container_id: str, init_starttime: int) -> None:
+    descriptor, temporary = tempfile.mkstemp(prefix=".active.", dir=STATE_DIR)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as output:
+            json.dump(
+                {
+                    "version": 2,
+                    "token": token,
+                    "container_id": container_id,
+                    "container_init_starttime": init_starttime,
+                    "phase": "claimed",
+                },
+                output,
+                separators=(",", ":"),
+            )
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_path.chmod(0o600)
+        temporary_path.replace(ACTIVE_PATH)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _current_init_starttime() -> int:
+    info = _process_info(1)
+    if info is None:
+        raise OSError("container init identity is unavailable")
+    return info[1]
+
+
+def _read_pid_init(path: Path) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            os.close(descriptor)
+            raise OSError("chat process state has unsafe ownership or type")
+        with os.fdopen(descriptor, encoding="ascii") as source:
+            payload = json.load(source)
+        value = int(payload["container_init_starttime"])
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise OSError("chat process state is invalid") from exc
+    if value < 1:
+        raise OSError("chat process state is invalid")
+    return value
+
+
+def _discard_previous_lifecycle(current_init_starttime: int) -> dict[str, str | int] | None:
+    active = _read_active()
+    pid_paths = tuple(STATE_DIR.glob("*.pid"))
+    if active is not None and active["container_init_starttime"] == current_init_starttime:
+        return active
+    if active is not None and _lock_is_held():
+        raise OSError("a prior-lifecycle chat lock is unexpectedly still held")
+    for pid_path in pid_paths:
+        token = pid_path.stem
+        if not TOKEN_RE.fullmatch(token):
+            raise OSError("chat process state has an invalid token name")
+        state_init = _read_pid_init(pid_path)
+        if state_init == current_init_starttime:
+            raise OSError("an abandoned chat process requires a Capsule lifecycle restart")
+        pid_path.unlink(missing_ok=True)
+        (STATE_DIR / f"{token}.stop").unlink(missing_ok=True)
+    if active is not None:
+        ACTIVE_PATH.unlink(missing_ok=True)
+    return None
+
+
+def _claim(token: str, container_id: str) -> int:
+    guard = _acquire_guard()
+    try:
+        init_starttime = _current_init_starttime()
+        active = _discard_previous_lifecycle(init_starttime)
+        if active is not None:
+            return 75
+        if _lock_is_held():
+            raise OSError("chat lifetime lock is held without an active claim")
+        _write_active(token, container_id, init_starttime)
+        return 0
+    finally:
+        os.close(guard)
+
+
+def _current(container_id: str) -> int:
+    guard = _acquire_guard()
+    try:
+        active = _discard_previous_lifecycle(_current_init_starttime())
+        if active is None:
+            if _lock_is_held():
+                raise OSError("chat lifetime lock is held without an active claim")
+            return 3
+        if active["container_id"] != container_id:
+            raise OSError("active chat claim belongs to a different container identity")
+        # A provider may close inherited descriptors, or the root wrapper may crash. The root-owned
+        # claim still blocks admission and must remain recoverable so authenticated Stop can either
+        # prove exact PID/starttime extinction or force the existing fail-stop Capsule restart path.
+        print(active["token"])
+        return 0
+    finally:
+        os.close(guard)
+
+
+def _process_info(pid: int) -> tuple[int, int, str] | None:
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = raw[raw.rfind(")") + 2 :].split()
+        return int(fields[1]), int(fields[19]), fields[0]
+    except FileNotFoundError, OSError, ValueError, IndexError:
+        return None
+
+
+def _same_process(pid: int, starttime: int) -> bool:
+    info = _process_info(pid)
+    return info is not None and info[1] == starttime and info[2] != "Z"
+
+
+def _read_state(path: Path) -> dict[str, int | str] | None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            os.close(descriptor)
+            return None
+        with os.fdopen(descriptor, encoding="ascii") as source:
+            payload = json.load(source)
+        state = {
+            "wrapper_pid": int(payload["wrapper_pid"]),
+            "wrapper_starttime": int(payload["wrapper_starttime"]),
+            "provider_pgid": int(payload["provider_pgid"]),
+            "provider_starttime": int(payload["provider_starttime"]),
+            "container_init_starttime": int(payload["container_init_starttime"]),
+        }
+    except FileNotFoundError, OSError, ValueError, TypeError, KeyError, json.JSONDecodeError:
+        return None
+    container_id = str(payload.get("container_id", ""))
+    if (
+        payload.get("version") != 3
+        or not CONTAINER_RE.fullmatch(container_id)
+        or not all(value > 1 for value in state.values())
+    ):
+        return None
+    return {**state, "container_id": container_id}
+
+
+def _descendants(root_pid: int, root_starttime: int) -> dict[int, int]:
+    if not _same_process(root_pid, root_starttime):
+        return {}
+    processes: dict[int, tuple[int, int, str]] = {}
+    with os.scandir("/proc") as entries:
+        for entry in entries:
+            if not entry.name.isdecimal():
+                continue
+            pid = int(entry.name)
+            info = _process_info(pid)
+            if info is not None:
+                processes[pid] = info
+    descendants: dict[int, int] = {}
+    parents = {root_pid}
+    while parents:
+        children = {
+            pid: starttime
+            for pid, (ppid, starttime, _state) in processes.items()
+            if ppid in parents and pid not in descendants
+        }
+        if not children:
+            break
+        descendants.update(children)
+        parents = set(children)
+    return descendants if _same_process(root_pid, root_starttime) else {}
+
+
+def _signal_pid(pid: int, starttime: int, signum: int) -> None:
+    try:
+        descriptor = _pidfd_open(pid)
+    except OSError:
+        return
+    try:
+        if _same_process(pid, starttime):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                _pidfd_send_signal(descriptor, signum)
+    finally:
+        os.close(descriptor)
+
+
+def _pidfd_open(pid: int) -> int:
+    descriptor = _LIBC.pidfd_open(pid, 0)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return descriptor
+
+
+def _pidfd_send_signal(descriptor: int, signum: int) -> None:
+    if _LIBC.pidfd_send_signal(descriptor, signum, None, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _turn_exists(state: dict[str, int | str], token: str) -> bool:
+    return (
+        _same_process(state["wrapper_pid"], state["wrapper_starttime"])
+        or _same_process(state["provider_pgid"], state["provider_starttime"])
+        or bool(_descendants(state["wrapper_pid"], state["wrapper_starttime"]))
+    )
+
+
+def _signal_children(state: dict[str, int | str], token: str, signum: int) -> None:
+    root_pid = state["wrapper_pid"]
+    _signal_pid(state["provider_pgid"], state["provider_starttime"], signum)
+    for pid, starttime in _descendants(root_pid, state["wrapper_starttime"]).items():
+        _signal_pid(pid, starttime, signum)
+
+
+def _signal_turn(state: dict[str, int | str], token: str, signum: int) -> None:
+    _signal_children(state, token, signum)
+    root_pid = state["wrapper_pid"]
+    _signal_pid(root_pid, state["wrapper_starttime"], signum)
+
+
+def _wait_turn_gone(
+    state: dict[str, int | str],
+    token: str,
+    seconds: float,
+    signum: int,
+    *,
+    signal_wrapper: bool = True,
+) -> bool:
+    deadline = time.monotonic() + seconds
+    while _turn_exists(state, token) and time.monotonic() < deadline:
+        if signal_wrapper:
+            _signal_turn(state, token, signum)
+        else:
+            _signal_children(state, token, signum)
+        time.sleep(POLL_SECONDS)
+    return not _turn_exists(state, token)
+
+
+def _purge_token_asks(token: str) -> None:
+    """Remove only IPC requests created by this killed logical turn."""
+    try:
+        directory = os.open(IPC_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        with os.scandir(directory) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_IPC_PURGE_ENTRIES:
+                    break
+                name = entry.name
+                suffix = ".req" if name.endswith(".req") else ".sent" if name.endswith(".sent") else ""
+                if not suffix:
+                    continue
+                try:
+                    before = entry.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > MAX_IPC_BYTES:
+                        continue
+                    descriptor = os.open(
+                        name,
+                        os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW,
+                        dir_fd=directory,
+                    )
+                    try:
+                        after = os.fstat(descriptor)
+                        if (
+                            not stat.S_ISREG(after.st_mode)
+                            or after.st_nlink != 1
+                            or after.st_size > MAX_IPC_BYTES
+                            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                        ):
+                            continue
+                        raw = os.read(descriptor, MAX_IPC_BYTES + 1)
+                    finally:
+                        os.close(descriptor)
+                    if len(raw) > MAX_IPC_BYTES:
+                        continue
+                    payload = json.loads(raw)
+                except OSError, ValueError, TypeError, RecursionError:
+                    continue
+                if not isinstance(payload, dict) or payload.get("_chat_token") != token:
+                    continue
+                rid = name[: -len(suffix)]
+                for owned_suffix in (".req", ".sent", ".await", ".resp"):
+                    with contextlib.suppress(OSError):
+                        os.unlink(f"{rid}{owned_suffix}", dir_fd=directory)
+    finally:
+        os.close(directory)
+
+
+def _clear(token: str) -> int:
+    guard = _acquire_guard()
+    try:
+        pid_path = STATE_DIR / f"{token}.pid"
+        state = _read_state(pid_path)
+        if state is not None and _turn_exists(state, token):
+            return 1
+        active = _read_active()
+        if active is not None and active["token"] == token:
+            if active["phase"] != "claimed" or _lock_is_held():
+                return 1
+            ACTIVE_PATH.unlink(missing_ok=True)
+        pid_path.unlink(missing_ok=True)
+        (STATE_DIR / f"{token}.stop").unlink(missing_ok=True)
+    finally:
+        os.close(guard)
+    # Keep the bounded, best-effort tenant IPC scan outside the admission guard. The questions API
+    # independently exposes only the currently active durable token, so an unpurged residue cannot
+    # become a ghost card or be answered after Stop.
+    _purge_token_asks(token)
+    return 0
+
+
+def _write_stop(token: str) -> None:
+    path = STATE_DIR / f"{token}.stop"
+    descriptor = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            raise OSError("chat Stop tombstone has unsafe ownership or type")
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+
+
+def _request(token: str) -> int:
+    guard = _acquire_guard()
+    early_result: int | None = None
+    state: dict[str, int | str] | None = None
+    try:
+        _write_stop(token)
+        active = _read_active()
+        if active is not None and active["token"] == token and active["phase"] == "claimed":
+            ACTIVE_PATH.unlink(missing_ok=True)
+            early_result = 0
+        else:
+            pid_path = STATE_DIR / f"{token}.pid"
+            state = _read_state(pid_path)
+            if state is None:
+                early_result = 1 if pid_path.exists() or (active is not None and active["token"] == token) else 3
+            elif (
+                active is None
+                or active["token"] != token
+                or active["phase"] != "running"
+                or state["container_id"] != active["container_id"]
+                or state["container_init_starttime"] != active["container_init_starttime"]
+            ):
+                return 1
+    finally:
+        os.close(guard)
+    if early_result is not None:
+        _purge_token_asks(token)
+        return early_result
+    if state is None:
+        raise OSError("chat process state disappeared during Stop")
+    if _turn_exists(state, token):
+        _signal_turn(state, token, signal.SIGTERM)
+        if not _wait_turn_gone(
+            state,
+            token,
+            TERM_GRACE_SECONDS,
+            signal.SIGTERM,
+            signal_wrapper=False,
+        ):
+            # Keep the subreaper itself alive while its descendants receive SIGKILL, so it can
+            # reap them and preserve the invariant that wrapper extinction means tree extinction.
+            _signal_children(state, token, signal.SIGKILL)
+            if not _wait_turn_gone(
+                state,
+                token,
+                KILL_GRACE_SECONDS,
+                signal.SIGKILL,
+                signal_wrapper=False,
+            ):
+                return 1
+    if _turn_exists(state, token):
+        return 1
+    # Only the subreaper removes this file after it has reaped the complete tree. A lingering
+    # file with a dead wrapper is crash/tamper evidence and must force the driver fail-safe restart.
+    if pid_path.exists():
+        return 1
+    _purge_token_asks(token)
+    return 0
+
+
+def main() -> int:
+    try:
+        _ensure_state_dir()
+    except OSError as exc:
+        print(f"could not secure chat control state: {exc}", file=sys.stderr)
+        return 70
+    if len(sys.argv) == 4 and sys.argv[1] == "claim":
+        token, container_id = sys.argv[2:]
+        if not TOKEN_RE.fullmatch(token) or not CONTAINER_RE.fullmatch(container_id):
+            print("usage: shimpz-chat-stop claim TOKEN CONTAINER_ID", file=sys.stderr)
+            return 64
+        try:
+            result = _claim(token, container_id)
+        except OSError as exc:
+            print(f"chat claim failed: {exc}", file=sys.stderr)
+            return 70
+        if result == 75:
+            print("shimpz-chat durable slot is already active", file=sys.stderr)
+        return result
+    if len(sys.argv) == 3 and sys.argv[1] == "current":
+        container_id = sys.argv[2]
+        if not CONTAINER_RE.fullmatch(container_id):
+            print("usage: shimpz-chat-stop current CONTAINER_ID", file=sys.stderr)
+            return 64
+        try:
+            return _current(container_id)
+        except OSError as exc:
+            print(f"chat current-state recovery failed: {exc}", file=sys.stderr)
+            return 70
+    clear = len(sys.argv) == 3 and sys.argv[1] == "clear"
+    token = sys.argv[2] if clear else (sys.argv[1] if len(sys.argv) == 2 else "")
+    if not TOKEN_RE.fullmatch(token):
+        print("usage: shimpz-chat-stop {claim TOKEN CONTAINER_ID|current CONTAINER_ID|[clear] TOKEN}", file=sys.stderr)
+        return 64
+    try:
+        return _clear(token) if clear else _request(token)
+    except OSError as exc:
+        print(f"chat control failed: {exc}", file=sys.stderr)
+        return 70
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,479 @@
+#!/opt/venv/bin/python
+"""Run one provider turn in a token-addressable, subreaped process tree."""
+
+from __future__ import annotations
+
+import contextlib
+import ctypes
+import fcntl
+import json
+import os
+import pwd
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
+CONTAINER_RE = re.compile(r"^[a-f0-9]{64}$")
+STATE_DIR = Path(os.environ.get("SHIMPZ_CHAT_STATE_DIR", "/run/shimpz-chat"))
+ACTIVE_PATH = STATE_DIR / "active.json"
+LOCK_PATH = STATE_DIR / "active.lock"
+GUARD_PATH = STATE_DIR / "guard.lock"
+BUSY_EXIT = 75
+BUSY_MARKER = "shimpz-chat durable slot is already active"
+TERM_GRACE_SECONDS = 5.0
+KILL_GRACE_SECONDS = 2.0
+POLL_SECONDS = 0.05
+PR_SET_CHILD_SUBREAPER = 36
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC.pidfd_open.argtypes = (ctypes.c_int, ctypes.c_uint)
+_LIBC.pidfd_open.restype = ctypes.c_int
+_LIBC.pidfd_send_signal.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint)
+_LIBC.pidfd_send_signal.restype = ctypes.c_int
+
+
+def _ensure_state_dir() -> None:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = STATE_DIR.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise OSError("chat control state directory has unsafe ownership or type")
+    STATE_DIR.chmod(0o700)
+
+
+def _open_lock(path: Path, *, nonblocking: bool) -> int | None:
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+        os.close(descriptor)
+        raise OSError("chat control lock has unsafe ownership or type")
+    os.fchmod(descriptor, 0o600)
+    try:
+        operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+        fcntl.flock(descriptor, operation)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+    return descriptor
+
+
+def _acquire_turn_lock() -> int | None:
+    return _open_lock(LOCK_PATH, nonblocking=True)
+
+
+def _acquire_guard() -> int:
+    descriptor = _open_lock(GUARD_PATH, nonblocking=False)
+    if descriptor is None:  # a blocking flock cannot report contention
+        raise OSError("chat control guard could not be acquired")
+    return descriptor
+
+
+def _container_init_starttime() -> int:
+    info = _process_info(1)
+    if info is None:
+        raise OSError("container init identity is unavailable")
+    return info[1]
+
+
+def _read_active() -> dict[str, str | int] | None:
+    try:
+        descriptor = os.open(ACTIVE_PATH, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            os.close(descriptor)
+            raise OSError("chat active-turn state has unsafe ownership or type")
+        with os.fdopen(descriptor, encoding="ascii") as source:
+            payload = json.load(source)
+        token = str(payload["token"])
+        container_id = str(payload["container_id"])
+        init_starttime = int(payload["container_init_starttime"])
+        phase = str(payload["phase"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise OSError("chat active-turn state is invalid") from exc
+    if (
+        payload.get("version") != 2
+        or not TOKEN_RE.fullmatch(token)
+        or not CONTAINER_RE.fullmatch(container_id)
+        or init_starttime < 1
+        or phase not in {"claimed", "running"}
+    ):
+        raise OSError("chat active-turn state is invalid")
+    return {
+        "version": 2,
+        "token": token,
+        "container_id": container_id,
+        "container_init_starttime": init_starttime,
+        "phase": phase,
+    }
+
+
+def _publish_active(token: str, container_id: str, init_starttime: int, phase: str) -> None:
+    fd, temporary = tempfile.mkstemp(prefix=".active.", dir=STATE_DIR)
+    temporary_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as output:
+            output.write(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "token": token,
+                        "container_id": container_id,
+                        "container_init_starttime": init_starttime,
+                        "phase": phase,
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            output.flush()
+            os.fsync(output.fileno())
+        temporary_path.chmod(0o600)
+        temporary_path.replace(ACTIVE_PATH)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _remove_active_exact(token: str, container_id: str, init_starttime: int) -> None:
+    guard = _acquire_guard()
+    try:
+        active = _read_active()
+        if active is None:
+            return
+        if (
+            active["token"] == token
+            and active["container_id"] == container_id
+            and active["container_init_starttime"] == init_starttime
+        ):
+            ACTIVE_PATH.unlink(missing_ok=True)
+    finally:
+        os.close(guard)
+
+
+def _process_info(pid: int) -> tuple[int, int] | None:
+    """Return (ppid, starttime) from procfs, or None after an exit/race."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = raw[raw.rfind(")") + 2 :].split()
+        return int(fields[1]), int(fields[19])
+    except FileNotFoundError, OSError, ValueError, IndexError:
+        return None
+
+
+def _same_process(pid: int, starttime: int) -> bool:
+    info = _process_info(pid)
+    return info is not None and info[1] == starttime
+
+
+def _descendants(root_pid: int) -> dict[int, int]:
+    """Snapshot every descendant PID and its non-reusable proc starttime."""
+    processes: dict[int, tuple[int, int]] = {}
+    with os.scandir("/proc") as entries:
+        for entry in entries:
+            if not entry.name.isdecimal():
+                continue
+            pid = int(entry.name)
+            info = _process_info(pid)
+            if info is not None:
+                processes[pid] = info
+    descendants: dict[int, int] = {}
+    parents = {root_pid}
+    while parents:
+        children = {
+            pid: starttime for pid, (ppid, starttime) in processes.items() if ppid in parents and pid not in descendants
+        }
+        if not children:
+            break
+        descendants.update(children)
+        parents = set(children)
+    return descendants
+
+
+def _signal_pid(pid: int, starttime: int, signum: int) -> None:
+    try:
+        descriptor = _pidfd_open(pid)
+    except OSError:
+        return
+    try:
+        if _same_process(pid, starttime):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                _pidfd_send_signal(descriptor, signum)
+    finally:
+        os.close(descriptor)
+
+
+def _pidfd_open(pid: int) -> int:
+    descriptor = _LIBC.pidfd_open(pid, 0)
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return descriptor
+
+
+def _pidfd_send_signal(descriptor: int, signum: int) -> None:
+    if _LIBC.pidfd_send_signal(descriptor, signum, None, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _signal_descendants(root_pid: int, signum: int) -> None:
+    for pid, starttime in _descendants(root_pid).items():
+        _signal_pid(pid, starttime, signum)
+
+
+def _reap_children() -> None:
+    while True:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
+
+def _enable_subreaper() -> None:
+    if _LIBC.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _provider_identity() -> dict:
+    """A production root wrapper always drops the provider child to the fixed tenant UID."""
+    if os.geteuid() != 0:
+        return {}
+    account = pwd.getpwnam(os.environ.get("SHIMPZ_CHAT_USER", "abc"))
+    return {
+        "user": account.pw_uid,
+        "group": account.pw_gid,
+        "extra_groups": os.getgrouplist(account.pw_name, account.pw_gid),
+        "umask": 0o022,
+    }
+
+
+def _signal_group(
+    root_pid: int,
+    pgid: int,
+    provider_starttime: int,
+    token: str,
+    signum: int,
+) -> None:
+    # Never use kill(2)/killpg(2) after a separate identity check: PID/PGID reuse can redirect that
+    # signal. pidfds anchor each exact process while repeated descendant snapshots cover the complete
+    # subreaped tree, including children that created a new session.
+    _signal_pid(pgid, provider_starttime, signum)
+    _signal_descendants(root_pid, signum)
+
+
+def _tree_exists(root_pid: int, pgid: int, provider_starttime: int, token: str) -> bool:
+    return _same_process(pgid, provider_starttime) or bool(_descendants(root_pid))
+
+
+def _end_tree(root_pid: int, pgid: int, provider_starttime: int, token: str) -> bool:
+    """TERM, then KILL all descendants, including those that escaped the PGID."""
+    _signal_group(root_pid, pgid, provider_starttime, token, signal.SIGTERM)
+    _signal_descendants(root_pid, signal.SIGTERM)
+    deadline = time.monotonic() + TERM_GRACE_SECONDS
+    while _tree_exists(root_pid, pgid, provider_starttime, token) and time.monotonic() < deadline:
+        _signal_descendants(root_pid, signal.SIGTERM)
+        _reap_children()
+        time.sleep(POLL_SECONDS)
+    if _tree_exists(root_pid, pgid, provider_starttime, token):
+        _signal_group(root_pid, pgid, provider_starttime, token, signal.SIGKILL)
+        _signal_descendants(root_pid, signal.SIGKILL)
+        deadline = time.monotonic() + KILL_GRACE_SECONDS
+        while _tree_exists(root_pid, pgid, provider_starttime, token) and time.monotonic() < deadline:
+            _signal_descendants(root_pid, signal.SIGKILL)
+            _reap_children()
+            time.sleep(POLL_SECONDS)
+    _reap_children()
+    return not _tree_exists(root_pid, pgid, provider_starttime, token)
+
+
+def _wait_for_child(
+    child: subprocess.Popen,
+    provider_starttime: int,
+    token: str,
+    stop_path: Path,
+) -> tuple[int, int]:
+    cancel_signal = 0
+    terminate_deadline = 0.0
+    kill_sent = False
+
+    def request_stop(signum, _frame=None) -> None:
+        nonlocal cancel_signal, terminate_deadline
+        if cancel_signal == 0:
+            cancel_signal = signum
+            terminate_deadline = time.monotonic() + TERM_GRACE_SECONDS
+        _signal_group(os.getpid(), child.pid, provider_starttime, token, signum)
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    if stop_path.exists():
+        request_stop(signal.SIGTERM)
+
+    while child.poll() is None:
+        if stop_path.exists() and cancel_signal == 0:
+            request_stop(signal.SIGTERM)
+        if cancel_signal and not kill_sent and time.monotonic() >= terminate_deadline:
+            _signal_group(os.getpid(), child.pid, provider_starttime, token, signal.SIGKILL)
+            _signal_descendants(os.getpid(), signal.SIGKILL)
+            kill_sent = True
+        elif cancel_signal:
+            _signal_descendants(os.getpid(), signal.SIGTERM)
+        time.sleep(POLL_SECONDS)
+    return int(child.returncode), cancel_signal
+
+
+def _cleanup_attempt(
+    *,
+    child: subprocess.Popen | None,
+    provider_starttime: int,
+    group_gone: bool,
+    temporary_path: Path | None,
+    pid_path: Path,
+    active_owned: bool,
+    token: str,
+    container_id: str,
+    init_starttime: int,
+    turn_lock: int,
+) -> None:
+    if child is None:
+        group_gone = True
+    elif not group_gone:
+        group_gone = _end_tree(os.getpid(), child.pid, provider_starttime, token)
+    if temporary_path is not None:
+        temporary_path.unlink(missing_ok=True)
+    if group_gone:
+        pid_path.unlink(missing_ok=True)
+    if active_owned and group_gone:
+        try:
+            _remove_active_exact(token, container_id, init_starttime)
+        except OSError as exc:
+            print(f"chat active-turn cleanup failed: {exc}", file=sys.stderr)
+    os.close(turn_lock)
+
+
+def main() -> int:
+    if len(sys.argv) < 4 or not TOKEN_RE.fullmatch(sys.argv[1]) or not CONTAINER_RE.fullmatch(sys.argv[2]):
+        print("usage: shimpz-chat-exec TOKEN CONTAINER_ID COMMAND [ARG ...]", file=sys.stderr)
+        return 64
+    token = sys.argv[1]
+    container_id = sys.argv[2]
+    try:
+        _ensure_state_dir()
+        turn_lock = _acquire_turn_lock()
+    except OSError as exc:
+        print(f"could not secure chat control state: {exc}", file=sys.stderr)
+        return 70
+    if turn_lock is None:
+        print(BUSY_MARKER, file=sys.stderr)
+        return BUSY_EXIT
+    pid_path = STATE_DIR / f"{token}.pid"
+    stop_path = STATE_DIR / f"{token}.stop"
+    child = None
+    provider_starttime = 0
+    temporary_path = None
+    group_gone = False
+    active_owned = False
+    init_starttime = 0
+    try:
+        init_starttime = _container_init_starttime()
+        guard = _acquire_guard()
+        try:
+            active = _read_active()
+            if stop_path.exists():
+                active_owned = (
+                    active is not None and active["token"] == token and active["container_id"] == container_id
+                )
+                return 143
+            if active != {
+                "version": 2,
+                "token": token,
+                "container_id": container_id,
+                "container_init_starttime": init_starttime,
+                "phase": "claimed",
+            }:
+                raise OSError("chat wrapper could not adopt its exact durable claim")
+            active_owned = True
+            _enable_subreaper()
+            child_env = dict(os.environ)
+            child_env["SHIMPZ_CHAT_TOKEN"] = token
+            child = subprocess.Popen(
+                sys.argv[3:],
+                stdin=sys.stdin.buffer,
+                stdout=sys.stdout.buffer,
+                stderr=sys.stderr.buffer,
+                env=child_env,
+                start_new_session=True,
+                pass_fds=(turn_lock,),
+                **_provider_identity(),
+            )
+            wrapper_info = _process_info(os.getpid())
+            provider_info = _process_info(child.pid)
+            if wrapper_info is None or provider_info is None:
+                raise OSError("chat process identity could not be captured")
+            provider_starttime = provider_info[1]
+            fd, temporary = tempfile.mkstemp(prefix=f".{token}.", dir=STATE_DIR)
+            temporary_path = Path(temporary)
+            with os.fdopen(fd, "w", encoding="ascii") as output:
+                output.write(
+                    json.dumps(
+                        {
+                            "version": 3,
+                            "wrapper_pid": os.getpid(),
+                            "wrapper_starttime": wrapper_info[1],
+                            "provider_pgid": child.pid,
+                            "provider_starttime": provider_starttime,
+                            "container_id": container_id,
+                            "container_init_starttime": init_starttime,
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+                output.flush()
+                os.fsync(output.fileno())
+            temporary_path.chmod(0o600)
+            temporary_path.replace(pid_path)
+            temporary_path = None
+            _publish_active(token, container_id, init_starttime, "running")
+        finally:
+            os.close(guard)
+
+        returncode, cancel_signal = _wait_for_child(child, provider_starttime, token, stop_path)
+        group_gone = _end_tree(os.getpid(), child.pid, provider_starttime, token)
+        if not group_gone:
+            print("provider process tree did not terminate", file=sys.stderr)
+            return 70
+        if cancel_signal:
+            return 128 + cancel_signal
+        return 128 + abs(returncode) if returncode < 0 else returncode
+    except OSError as exc:
+        print(f"chat control failed: {exc}", file=sys.stderr)
+        return 70
+    finally:
+        _cleanup_attempt(
+            child=child,
+            provider_starttime=provider_starttime,
+            group_gone=group_gone,
+            temporary_path=temporary_path,
+            pid_path=pid_path,
+            active_owned=active_owned,
+            token=token,
+            container_id=container_id,
+            init_starttime=init_starttime,
+            turn_lock=turn_lock,
+        )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
