@@ -3,3 +3,11 @@ LICENSE
 README.md
 **/__pycache__
 **/*.pyc
+
+# Never send local credentials or runtime configuration to the build context.
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example

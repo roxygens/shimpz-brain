@@ -2,3 +2,11 @@
 # Build artefacts — never committed (keeps the every-turn sync clean)
 __pycache__/
 *.py[cod]
+
+# Local credentials and runtime configuration — examples remain reviewable.
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
