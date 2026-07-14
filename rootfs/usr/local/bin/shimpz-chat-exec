@@ -107,7 +107,7 @@ def _read_active() -> dict[str, str | int] | None:
         or not TOKEN_RE.fullmatch(token)
         or not CONTAINER_RE.fullmatch(container_id)
         or init_starttime < 1
-        or phase not in {"claimed", "running"}
+        or phase not in {"claimed", "starting", "running"}
     ):
         raise OSError("chat active-turn state is invalid")
     return {
@@ -406,6 +406,10 @@ def main() -> int:
                 raise OSError("chat wrapper could not adopt its exact durable claim")
             active_owned = True
             _enable_subreaper()
+            # Persist conservative spawn intent before Popen. If this root wrapper crashes from
+            # this point onward, Stop must preserve the durable token and force the Capsule
+            # lifecycle fallback even when no process-identity file has been published yet.
+            _publish_active(token, container_id, init_starttime, "starting")
             child_env = dict(os.environ)
             child_env["SHIMPZ_CHAT_TOKEN"] = token
             child = subprocess.Popen(

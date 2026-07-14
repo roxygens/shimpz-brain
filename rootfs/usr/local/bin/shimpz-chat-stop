@@ -107,7 +107,7 @@ def _read_active() -> dict[str, str | int] | None:
         or not TOKEN_RE.fullmatch(token)
         or not CONTAINER_RE.fullmatch(container_id)
         or init_starttime < 1
-        or phase not in {"claimed", "running"}
+        or phase not in {"claimed", "starting", "running"}
     ):
         raise OSError("chat active-turn state is invalid")
     return {
