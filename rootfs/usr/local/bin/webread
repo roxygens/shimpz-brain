@@ -30,7 +30,7 @@ def _title(html, url):
     try:
         md = trafilatura.extract_metadata(html, default_url=url)
         return getattr(md, "title", None) if md else None
-    except Exception:  # noqa: BLE001 — best-effort optional metadata (3rd-party HTML parse); title degrades to the URL
+    except AttributeError, TypeError, ValueError:
         return None
 
 
