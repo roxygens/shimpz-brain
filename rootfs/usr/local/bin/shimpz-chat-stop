@@ -190,6 +190,7 @@ def _discard_previous_lifecycle(current_init_starttime: int) -> dict[str, str | 
         (STATE_DIR / f"{token}.stop").unlink(missing_ok=True)
     if active is not None:
         ACTIVE_PATH.unlink(missing_ok=True)
+        (STATE_DIR / f"{active['token']}.stop").unlink(missing_ok=True)
     return None
 
 
@@ -434,6 +435,11 @@ def _clear(token: str) -> int:
         state = _read_state(pid_path)
         if state is not None and _turn_exists(state, token):
             return 1
+        # A dead wrapper with a lingering state entry may have spawned a setsid descendant that
+        # can no longer be attributed from procfs. Only a Capsule lifecycle change can discard
+        # that crash/tamper evidence, even when every recorded PID is already extinct.
+        if _path_entry_exists(pid_path):
+            return 1
         active = _read_active()
         if active is not None and active["token"] == token:
             if active["phase"] != "claimed" or _lock_is_held():
@@ -523,7 +529,7 @@ def _request(token: str) -> int:
         return 1
     # Only the subreaper removes this file after it has reaped the complete tree. A lingering
     # file with a dead wrapper is crash/tamper evidence and must force the driver fail-safe restart.
-    if pid_path.exists():
+    if _path_entry_exists(pid_path):
         return 1
     _purge_token_asks(token)
     return 0
