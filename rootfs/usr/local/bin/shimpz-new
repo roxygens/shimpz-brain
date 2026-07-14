@@ -104,6 +104,7 @@ name = "{name}-backend"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
+    "aiokafka>=0.14",
     "fastapi",
     "uvicorn[standard]",
     "sqlalchemy>=2",
@@ -382,6 +383,7 @@ import contextlib
 from contextlib import asynccontextmanager
 
 import structlog
+from aiokafka.errors import KafkaError
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 import shimpzbus
@@ -417,7 +419,7 @@ async def _pump() -> None:
                 await _fanout(event)
         except asyncio.CancelledError:
             raise  # shutdown — never swallow cancellation
-        except Exception:  # noqa: BLE001 — reconnect boundary: any broker/network error lands here; loud, then retry
+        except (KafkaError, OSError, RuntimeError, ValueError):
             log.exception("ws_pump_error", topic=TOPIC)
             await asyncio.sleep(3)
 
