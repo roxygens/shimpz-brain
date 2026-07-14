@@ -53,6 +53,7 @@ ARG RCLONE_SHA256=dbee7ccd7a5d617e4ed4cd4555c16669b511abfe8d31164f61be35ac9e999b
 ARG RUFF_SHA256=df8e74862d4cd4fdac11faf3048789896ff9898a0cacb98497df20d0a1cc7bb4
 ARG NODE_SHA256=55aa7153f9d88f28d765fcdad5ae6945b5c0f98a36881703817e4c450fa76742
 ARG CADDY_SHA256=527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9
+ARG GOOGLE_CHROME_SHA256=0f19e68dca574849632e25229f15853d2beac33fa06498feed43f34628bc2d53
 
 # The KasmVNC base is Ubuntu Noble, not Debian. Replace every inherited APT source (including the
 # unused Docker repository) with Canonical's timestamped Ubuntu archive before any apt-get invocation.
@@ -163,14 +164,15 @@ RUN apt-get update && \
     echo "${RCLONE_SHA256}  /tmp/rclone.zip" | sha256sum -c - && \
     unzip -j /tmp/rclone.zip '*/rclone' -d /usr/local/bin/ && \
     chmod +x /usr/local/bin/rclone && rm -f /tmp/rclone.zip && \
-    # --- Google Chrome Stable (official repo) ---
-    install -d -m 0755 /etc/apt/keyrings && \
-    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-        | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg && \
-    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
-        > /etc/apt/sources.list.d/google-chrome.list && \
-    apt-get update && apt-get install -y --no-install-recommends \
-        "google-chrome-stable=${GOOGLE_CHROME_VERSION}" && \
+    # The signed APT index retains only the current stable version. Fetch the immutable versioned
+    # pool object instead, bind its exact bytes, and verify the embedded package version before install.
+    curl --proto '=https' --tlsv1.2 -fsSL \
+        "https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_${GOOGLE_CHROME_VERSION}_amd64.deb" \
+        -o /tmp/google-chrome-stable.deb && \
+    echo "${GOOGLE_CHROME_SHA256}  /tmp/google-chrome-stable.deb" | sha256sum -c - && \
+    test "$(dpkg-deb --field /tmp/google-chrome-stable.deb Version)" = "${GOOGLE_CHROME_VERSION}" && \
+    apt-get install -y --no-install-recommends /tmp/google-chrome-stable.deb && \
+    rm -f /tmp/google-chrome-stable.deb && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/lib/apt/periodic/* /var/cache/apt/* /var/cache/fontconfig/* \
         /var/cache/ldconfig/aux-cache /var/cache/man/* /var/log/apt/* \
