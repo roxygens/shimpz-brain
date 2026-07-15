@@ -261,12 +261,11 @@ RUN curl -LsSf "https://github.com/astral-sh/ruff/releases/download/${RUFF_VERSI
     rm -rf /tmp/ruff.tar.gz /tmp/ruff-x86_64-unknown-linux-gnu && \
     ruff --version
 
-# --- Node 24 + pnpm: frontend toolchain for Shimpz's SvelteKit/Vite projects ---
-# CRITICAL: do NOT replace the base image's system Node. KasmVNC's `kclient` (the desktop web
-# frontend) loads native addons (pulseaudio2 → libnode.so.109) built against the base Node 20;
-# installing Node 24 over it via apt deletes libnode.so.109 → kclient crash-loops → desktop 502.
-# So Node 24 lives in /opt/node24 (its own prefix); the system Node stays for kclient. Shimpz gets
-# /opt/node24/bin on PATH via the gateway/shimpz-run env + a login profile.d.
+# --- Node 24 + pnpm: the Brain's only Node runtime and frontend toolchain -----------------
+# The KasmVNC base carries Ubuntu's Node 18 solely for its desktop kclient. This headless image
+# removes that service from the active bundle, so retaining its obsolete runtime and native ABI is
+# unnecessary attack surface. Keep the pinned Node 24 tarball isolated in /opt, remove every legacy
+# runtime package, then expose Node 24 globally for both supervised and interactive processes.
 RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" -o /tmp/node.tar.xz && \
     echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c - && \
     mkdir -p /opt/node24 && tar -xJf /tmp/node.tar.xz -C /opt/node24 --strip-components=1 && \
@@ -274,10 +273,17 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
     export PATH=/opt/node24/bin:$PATH && \
     npm install -g "pnpm@${PNPM_VERSION}" && \
     printf 'export PATH=/opt/node24/bin:$PATH\n' > /etc/profile.d/node24.sh && \
-    node --version && pnpm --version && \
+    apt-get purge -y nodejs libnode109 node-acorn && \
+    ! dpkg-query -W nodejs libnode109 node-acorn >/dev/null 2>&1 && \
+    test ! -e /usr/bin/node && \
+    test ! -e /usr/lib/x86_64-linux-gnu/libnode.so.109 && \
+    node --version | grep -Fx "v${NODE_VERSION}" && pnpm --version && \
     # The LSIO base sets HOME=/config, so npm writes timestamped logs and cache indexes here rather
     # than under /root. Remove both possible homes plus Node's compile cache in this same layer.
-    rm -rf /config/.npm /root/.npm /tmp/node-compile-cache
+    apt-get clean && \
+    rm -rf /config/.npm /root/.npm /tmp/node-compile-cache /var/lib/apt/lists/*
+
+ENV PATH="/opt/node24/bin:${PATH}"
 
 # --- Deploy/runtime tooling (binaries baked now; WIRED to run in Phase 2): ---
 # cron = scheduled jobs/checks; supervisor = where Shimpz registers app services (one port each);

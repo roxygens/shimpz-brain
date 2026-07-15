@@ -32,9 +32,8 @@ def load(home=None):
 def brain_env():
     """The environment for spawning Shimpz's brain and its helpers (`claude -p`, shimpz-login).
 
-    HOME is the agent user's /config; Node 24 is first on PATH (it lives OFF the system PATH so
-    KasmVNC's kclient keeps base Node 20). No DISPLAY: the brain container has no X server — UI
-    tools are HTTP clients of browser-agent.
+    HOME is the agent user's /config; Node 24 is first on PATH and is the image's only Node runtime.
+    No DISPLAY: the brain container has no X server — UI tools are HTTP clients of browser-agent.
     """
     env = dict(os.environ)
     env["HOME"] = "/config"
