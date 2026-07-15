@@ -281,7 +281,10 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
     # The LSIO base sets HOME=/config, so npm writes timestamped logs and cache indexes here rather
     # than under /root. Remove both possible homes plus Node's compile cache in this same layer.
     apt-get clean && \
-    rm -rf /config/.npm /root/.npm /tmp/node-compile-cache /var/lib/apt/lists/*
+    rm -rf /config/.npm /root/.npm /tmp/node-compile-cache \
+        /var/lib/apt/lists/* /var/lib/apt/periodic/* /var/cache/apt/* /var/cache/fontconfig/* \
+        /var/cache/ldconfig/aux-cache /var/cache/man/* /var/log/apt/* \
+        /var/log/alternatives.log /var/log/dpkg.log
 
 ENV PATH="/opt/node24/bin:${PATH}"
 
