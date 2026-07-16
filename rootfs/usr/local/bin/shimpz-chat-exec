@@ -20,6 +20,7 @@ from pathlib import Path
 
 TOKEN_RE = re.compile(r"^[a-f0-9]{32}$")
 CONTAINER_RE = re.compile(r"^[a-f0-9]{64}$")
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 STATE_DIR = Path(os.environ.get("SHIMPZ_CHAT_STATE_DIR", "/run/shimpz-chat"))
 ACTIVE_PATH = STATE_DIR / "active.json"
 LOCK_PATH = STATE_DIR / "active.lock"
@@ -35,6 +36,128 @@ _LIBC.pidfd_open.argtypes = (ctypes.c_int, ctypes.c_uint)
 _LIBC.pidfd_open.restype = ctypes.c_int
 _LIBC.pidfd_send_signal.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint)
 _LIBC.pidfd_send_signal.restype = ctypes.c_int
+DECISION_SCHEMA_PATH = Path("/usr/local/share/shimpz-chat/decision.schema.json")
+INSTRUMENT_PROMPT_PATH = Path("/usr/local/share/shimpz-chat/instrument-prompt.txt")
+ASSET_MAX_BYTES = 64 * 1024
+FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PASSTHROUGH_ENV = frozenset(
+    {
+        # Provider credentials. The Claude bootstrap may add one of these after this scrub by
+        # sourcing its private, controller-written credential file.
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        # The Capsule egress proxy is the provider's only network path.
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        # Optional trust roots are runtime configuration, never Capsule Service credentials.
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "NODE_EXTRA_CA_CERTS",
+    }
+)
+
+
+def _read_image_asset(path: Path) -> str:
+    """Read one immutable root-owned runtime asset without following links."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_nlink != 1
+            or info.st_size < 1
+            or info.st_size > ASSET_MAX_BYTES
+            or info.st_mode & 0o022
+        ):
+            raise OSError(f"unsafe chat instrument asset: {path}")
+        raw = os.read(descriptor, ASSET_MAX_BYTES + 1)
+    finally:
+        os.close(descriptor)
+    if len(raw) > ASSET_MAX_BYTES:
+        raise OSError(f"oversized chat instrument asset: {path}")
+    return raw.decode("utf-8")
+
+
+def _provider_environment(source: dict[str, str]) -> dict[str, str]:
+    """Build a provider environment from an allowlist, never from Capsule ambient state."""
+    environment = {name: source[name] for name in PASSTHROUGH_ENV if source.get(name)}
+    environment.update(
+        {
+            "HOME": "/config",
+            "LANG": "C.UTF-8",
+            "PATH": FIXED_PATH,
+            "TMPDIR": "/tmp",  # noqa: S108 - the provider gets no filesystem tools
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "DISABLE_AUTOUPDATER": "1",
+            "DISABLE_ERROR_REPORTING": "1",
+            "DISABLE_TELEMETRY": "1",
+        }
+    )
+    return environment
+
+
+def _option_value(arguments: list[str], names: frozenset[str]) -> str | None:
+    found = None
+    for index, argument in enumerate(arguments):
+        if argument in names:
+            if index + 1 >= len(arguments):
+                raise ValueError(f"missing value for {argument}")
+            found = arguments[index + 1]
+    return found
+
+
+def _instrument_claude_command(command: list[str]) -> list[str]:
+    """Replace Claude's agent argv with the fixed, tool-free instrument contract."""
+    claude_index = next(
+        (index for index, value in enumerate(command) if Path(value).name == "claude"),
+        None,
+    )
+    if claude_index is None:
+        return command
+    requested = command[claude_index + 1 :]
+    output_format = _option_value(requested, frozenset({"--output-format"})) or "text"
+    if output_format not in {"text", "stream-json"}:
+        raise ValueError("unsupported Claude output format")
+    model = _option_value(requested, frozenset({"--model"}))
+    if model is not None and MODEL_RE.fullmatch(model) is None:
+        raise ValueError("unsupported Claude model")
+
+    schema = json.dumps(json.loads(_read_image_asset(DECISION_SCHEMA_PATH)), separators=(",", ":"))
+    prompt = _read_image_asset(INSTRUMENT_PROMPT_PATH).strip()
+    hardened = [
+        command[claude_index],
+        "-p",
+        "--safe-mode",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--mcp-config",
+        '{"mcpServers":{}}',
+        "--no-chrome",
+        "--no-session-persistence",
+        "--permission-mode",
+        "dontAsk",
+        "--tools",
+        "",
+        "--system-prompt",
+        prompt,
+        "--json-schema",
+        schema,
+        "--output-format",
+        output_format,
+    ]
+    if model:
+        hardened.extend(("--model", model))
+    if output_format == "stream-json":
+        hardened.extend(("--verbose", "--include-partial-messages"))
+    return [*command[:claude_index], *hardened]
 
 
 def _ensure_state_dir() -> None:
@@ -410,13 +533,14 @@ def main() -> int:
             # this point onward, Stop must preserve the durable token and force the Capsule
             # lifecycle fallback even when no process-identity file has been published yet.
             _publish_active(token, container_id, init_starttime, "starting")
-            child_env = dict(os.environ)
-            child_env["SHIMPZ_CHAT_TOKEN"] = token
+            command = _instrument_claude_command(sys.argv[3:])
+            child_env = _provider_environment(dict(os.environ))
             child = subprocess.Popen(
-                sys.argv[3:],
+                command,
                 stdin=sys.stdin.buffer,
                 stdout=sys.stdout.buffer,
                 stderr=sys.stderr.buffer,
+                cwd="/tmp",  # noqa: S108 - fixed empty runtime cwd, never the tenant workspace
                 env=child_env,
                 start_new_session=True,
                 pass_fds=(turn_lock,),
@@ -461,7 +585,7 @@ def main() -> int:
         if cancel_signal:
             return 128 + cancel_signal
         return 128 + abs(returncode) if returncode < 0 else returncode
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         print(f"chat control failed: {exc}", file=sys.stderr)
         return 70
     finally:

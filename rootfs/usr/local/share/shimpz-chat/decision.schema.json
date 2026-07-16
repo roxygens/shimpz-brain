@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "message", "power", "input"],
+  "properties": {
+    "kind": {
+      "enum": ["message", "power"]
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 32000
+    },
+    "power": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$|^$"
+    },
+    "input": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {"const": "message"}
+        }
+      },
+      "then": {
+        "properties": {
+          "message": {"minLength": 1},
+          "power": {"const": ""},
+          "input": {"maxProperties": 0}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {"const": "power"}
+        }
+      },
+      "then": {
+        "properties": {
+          "power": {"minLength": 1}
+        }
+      }
+    }
+  ]
+}
