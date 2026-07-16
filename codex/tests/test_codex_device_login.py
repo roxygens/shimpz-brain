@@ -62,8 +62,7 @@ class CodexDeviceLoginTest(unittest.TestCase):
             if payload.get("pending") is False:
                 return payload
             time.sleep(0.05)
-        self.fail("device information did not become available")
-        return {}
+        raise self.failureException("device information did not become available")
 
     def test_success_exposes_only_official_device_information(self) -> None:
         completed = self.command("run")
