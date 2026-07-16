@@ -49,7 +49,7 @@ def _atomic_write(path: Path, value: str) -> None:
             output.write(value)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary_path, path)
+        temporary_path.replace(path)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -154,7 +154,7 @@ def _authenticated() -> bool:
             check=False,
         )
         payload = json.loads(completed.stdout or b"{}")
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, UnicodeDecodeError):
+    except OSError, subprocess.SubprocessError, json.JSONDecodeError, UnicodeDecodeError:
         return False
     return (
         completed.returncode == 0
@@ -164,6 +164,56 @@ def _authenticated() -> bool:
         and payload.get("configured") is True
         and payload.get("auth_type") == "oauth"
     )
+
+
+def _publish_challenge_line(line: bytes, url: str | None, code: str | None) -> tuple[str | None, str | None]:
+    found_url, found_code = _parse_line(line)
+    url = url or found_url
+    code = code or found_code
+    if url and code and not (LOGIN_DIR / "url").exists():
+        _atomic_write(LOGIN_DIR / "url", url)
+        _atomic_write(LOGIN_DIR / "user_code", code)
+        _write_result("waiting")
+    return url, code
+
+
+def _collect_challenge(
+    child: subprocess.Popen[bytes],
+) -> tuple[str | None, str | None, dict[str, object] | None]:
+    if child.stdout is None:
+        return None, None, _result("failed", "Codex device login output is unavailable")
+    output_fd = child.stdout.fileno()
+    os.set_blocking(output_fd, False)
+    started = time.monotonic()
+    buffered = b""
+    total = 0
+    url = code = None
+    while child.poll() is None:
+        if (LOGIN_DIR / "cancel").exists():
+            return url, code, _result("cancelled")
+        if time.monotonic() - started >= TIMEOUT:
+            return url, code, _result("timeout", "Codex device login expired; start again")
+        readable, _, _ = select.select([output_fd], [], [], 0.2)
+        if not readable:
+            continue
+        try:
+            chunk = os.read(output_fd, 4096)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > MAX_OUTPUT_BYTES:
+            return url, code, _result("failed", "Codex device login returned too much output")
+        buffered += chunk
+        if len(buffered) > MAX_LINE_BYTES and b"\n" not in buffered:
+            return url, code, _result("failed", "Codex device login returned an oversized line")
+        while b"\n" in buffered:
+            line, buffered = buffered.split(b"\n", 1)
+            if len(line) > MAX_LINE_BYTES:
+                return url, code, _result("failed", "Codex device login returned an oversized line")
+            url, code = _publish_challenge_line(line, url, code)
+    return url, code, None
 
 
 def run() -> int:
@@ -187,55 +237,11 @@ def run() -> int:
         except OSError:
             _write_result("failed", "Codex device login could not start")
             return 1
-        assert child.stdout is not None
-        output_fd = child.stdout.fileno()
-        os.set_blocking(output_fd, False)
-        started = time.monotonic()
-        buffered = b""
-        total = 0
-        url = code = None
-        failure = None
-        while child.poll() is None:
-            if (LOGIN_DIR / "cancel").exists():
-                failure = _result("cancelled")
-                break
-            if time.monotonic() - started >= TIMEOUT:
-                failure = _result("timeout", "Codex device login expired; start again")
-                break
-            readable, _, _ = select.select([output_fd], [], [], 0.2)
-            if not readable:
-                continue
-            try:
-                chunk = os.read(output_fd, 4096)
-            except BlockingIOError:
-                continue
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > MAX_OUTPUT_BYTES:
-                failure = _result("failed", "Codex device login returned too much output")
-                break
-            buffered += chunk
-            if len(buffered) > MAX_LINE_BYTES and b"\n" not in buffered:
-                failure = _result("failed", "Codex device login returned an oversized line")
-                break
-            while b"\n" in buffered:
-                line, buffered = buffered.split(b"\n", 1)
-                if len(line) > MAX_LINE_BYTES:
-                    failure = _result("failed", "Codex device login returned an oversized line")
-                    break
-                found_url, found_code = _parse_line(line)
-                url = url or found_url
-                code = code or found_code
-                if url and code and not (LOGIN_DIR / "url").exists():
-                    _atomic_write(LOGIN_DIR / "url", url)
-                    _atomic_write(LOGIN_DIR / "user_code", code)
-                    _write_result("waiting")
-            if failure:
-                break
+        url, code, failure = _collect_challenge(child)
         if failure:
             _terminate(child)
-            _write_result(str(failure["state"]), failure.get("message"))
+            message = failure.get("message")
+            _write_result(str(failure["state"]), message if isinstance(message, str) else None)
             return 1
         returncode = child.wait()
         if returncode == 0 and url and code and _authenticated():
@@ -257,7 +263,7 @@ def info() -> int:
             raise ValueError("device login is not waiting")
         url = _safe_read(LOGIN_DIR / "url").strip()
         user_code = _safe_read(LOGIN_DIR / "user_code").strip().upper()
-    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+    except OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError:
         print('{"pending":true}')
         return 0
     if _official_url(url) != url or USER_CODE_RE.fullmatch(user_code) is None:
@@ -270,7 +276,7 @@ def info() -> int:
 def result() -> int:
     try:
         payload = json.loads(_safe_read(LOGIN_DIR / "result"))
-    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+    except OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError:
         payload = {"state": "idle"}
     allowed_states = {"idle", "starting", "waiting", "succeeded", "failed", "cancelled", "timeout"}
     if not isinstance(payload, dict) or payload.get("state") not in allowed_states:

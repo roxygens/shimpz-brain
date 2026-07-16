@@ -10,7 +10,6 @@ import time
 import unittest
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).parents[1] / "rootfs" / "opt" / "shimpz-lib" / "codex_device_login.py"
 
 
@@ -25,12 +24,11 @@ class CodexDeviceLoginTest(unittest.TestCase):
             "#!/bin/sh\n"
             "printf '\\033[94mhttps://auth.openai.com/codex/device\\033[0m\\n'\n"
             "printf '\\033[94mAB12-CDE34\\033[0m\\n'\n"
-            "sleep \"${FAKE_CODEX_SLEEP:-0.1}\"\n",
+            'sleep "${FAKE_CODEX_SLEEP:-0.1}"\n',
             encoding="utf-8",
         )
         self.auth.write_text(
-            "#!/bin/sh\n"
-            "printf '%s\\n' '{\"provider\":\"codex\",\"configured\":true,\"auth_type\":\"oauth\"}'\n",
+            '#!/bin/sh\nprintf \'%s\\n\' \'{"provider":"codex","configured":true,"auth_type":"oauth"}\'\n',
             encoding="utf-8",
         )
         self.codex.chmod(0o700)
@@ -65,6 +63,7 @@ class CodexDeviceLoginTest(unittest.TestCase):
                 return payload
             time.sleep(0.05)
         self.fail("device information did not become available")
+        return {}
 
     def test_success_exposes_only_official_device_information(self) -> None:
         completed = self.command("run")
