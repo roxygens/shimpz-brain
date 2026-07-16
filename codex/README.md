@@ -25,6 +25,9 @@ The capsule-driver contract is:
 - API-key configure: pipe the unsealed secret to
   `docker exec --interactive --user 1000:1000 CAPSULE shimpz-codex-auth api-key`
 - OAuth configure: pipe the unsealed `auth.json` object to the same command with `oauth-cache`.
+- Interactive ChatGPT login: run `shimpz-codex-auth device-login` detached, then read the strict
+  `device-info` response. Open its official OpenAI URL and enter `user_code` there; Shimpz never asks
+  the user to paste that code or an `auth.json`. Poll `status`/`device-result`, or use `device-cancel`.
 - New chat: pipe the prompt to
   `docker exec --interactive --user 1000:1000 CAPSULE shimpz-codex-run new text`
 - Continue chat: use `shimpz-codex-run resume text`; replace `text` with `json` for JSONL events.
