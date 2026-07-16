@@ -112,6 +112,9 @@ def _result(state: str, message: str | None = None) -> dict[str, object]:
 
 
 def _write_result(state: str, message: str | None = None) -> None:
+    if state in {"succeeded", "failed", "cancelled", "timeout"}:
+        for name in ("url", "user_code"):
+            (LOGIN_DIR / name).unlink(missing_ok=True)
     _atomic_write(LOGIN_DIR / "result", json.dumps(_result(state, message), separators=(",", ":")))
 
 
@@ -249,9 +252,12 @@ def run() -> int:
 
 def info() -> int:
     try:
+        state = json.loads(_safe_read(LOGIN_DIR / "result"))
+        if not isinstance(state, dict) or set(state) - {"state", "message"} or state.get("state") != "waiting":
+            raise ValueError("device login is not waiting")
         url = _safe_read(LOGIN_DIR / "url").strip()
         user_code = _safe_read(LOGIN_DIR / "user_code").strip().upper()
-    except (OSError, UnicodeDecodeError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
         print('{"pending":true}')
         return 0
     if _official_url(url) != url or USER_CODE_RE.fullmatch(user_code) is None:

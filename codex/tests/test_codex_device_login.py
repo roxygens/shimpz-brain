@@ -69,18 +69,11 @@ class CodexDeviceLoginTest(unittest.TestCase):
     def test_success_exposes_only_official_device_information(self) -> None:
         completed = self.command("run")
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(
-            json.loads(self.command("info").stdout),
-            {
-                "pending": False,
-                "url": "https://auth.openai.com/codex/device",
-                "user_code": "AB12-CDE34",
-            },
-        )
+        self.assertEqual(json.loads(self.command("info").stdout), {"pending": True})
         self.assertEqual(json.loads(self.command("result").stdout), {"state": "succeeded"})
-        for name in ("url", "user_code", "result"):
-            mode = stat.S_IMODE((self.state / name).stat().st_mode)
-            self.assertEqual(mode, 0o600)
+        self.assertFalse((self.state / "url").exists())
+        self.assertFalse((self.state / "user_code").exists())
+        self.assertEqual(stat.S_IMODE((self.state / "result").stat().st_mode), 0o600)
         self.assertNotIn("AB12-CDE34", completed.stdout + completed.stderr)
 
     def test_unofficial_url_is_never_exposed(self) -> None:
@@ -110,6 +103,7 @@ class CodexDeviceLoginTest(unittest.TestCase):
             self.assertEqual(json.loads(cancelled.stdout), {"cancelled": True})
             _stdout, _stderr = running.communicate(timeout=8)
             self.assertEqual(json.loads(self.command("result").stdout), {"state": "cancelled"})
+            self.assertEqual(json.loads(self.command("info").stdout), {"pending": True})
         finally:
             if running.poll() is None:
                 running.kill()
