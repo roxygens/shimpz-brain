@@ -241,6 +241,13 @@ class AgentRuntime:
         self._checkpointer = checkpointer
         self._model_factory = model_factory
 
+    def close(self) -> None:
+        """Close a durable checkpointer connection when this runtime owns one."""
+        connection = getattr(self._checkpointer, "conn", None)
+        close = getattr(connection, "close", None)
+        if callable(close):
+            close()
+
     @staticmethod
     def _config(context: TurnContext) -> dict[str, object]:
         return {
