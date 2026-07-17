@@ -1,6 +1,11 @@
 .git
 LICENSE
 README.md
+codex
+rootfs
+tests
+.ruff_cache
+.venv
 **/__pycache__
 **/*.pyc
 
