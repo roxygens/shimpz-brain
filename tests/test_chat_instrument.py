@@ -57,6 +57,8 @@ class ChatInstrumentTest(unittest.TestCase):
         self.assertIn("--safe-mode", hardened)
         self.assertIn("--disable-slash-commands", hardened)
         self.assertIn("--strict-mcp-config", hardened)
+        self.assertEqual(hardened[hardened.index("--output-format") + 1], "json")
+        self.assertNotIn("--include-partial-messages", hardened)
         self.assertEqual(hardened[hardened.index("--tools") + 1], "")
         self.assertEqual(json.loads(hardened[hardened.index("--mcp-config") + 1]), {"mcpServers": {}})
         self.assertEqual(
@@ -64,6 +66,51 @@ class ChatInstrumentTest(unittest.TestCase):
             json.loads(SCHEMA.read_text(encoding="utf-8")),
         )
         self.assertIn("no authority to use a shell", hardened[hardened.index("--system-prompt") + 1])
+
+    def test_schema_and_prompt_use_bounded_json_string_input(self) -> None:
+        schema = json.loads(SCHEMA.read_text(encoding="utf-8"))
+        prompt = PROMPT.read_text(encoding="utf-8")
+
+        self.assertEqual(schema["required"], ["kind", "message", "power", "input"])
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(schema["properties"]["input"], {"type": "string", "maxLength": 16384})
+        self.assertNotIn("allOf", schema)
+        self.assertIn('input exactly "{}"', prompt)
+
+    def test_claude_result_is_normalized_to_one_canonical_decision(self) -> None:
+        envelope = {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "structured_output": {
+                "kind": "power",
+                "message": "",
+                "power": "welcome",
+                "input": '{ "name": "Ada", "details": {"z": 2, "a": 1} }',
+            },
+        }
+
+        normalized = self.module._normalize_claude_output(json.dumps(envelope).encode("utf-8"))
+
+        self.assertEqual(
+            normalized,
+            b'{"kind":"power","message":"","power":"welcome","input":"{\\"details\\":{\\"a\\":1,\\"z\\":2},\\"name\\":\\"Ada\\"}"}\n',
+        )
+
+    def test_invalid_claude_decisions_fail_closed(self) -> None:
+        valid = {"kind": "message", "message": "Hello", "power": "", "input": "{}"}
+        self.assertEqual(json.loads(self.module._canonical_decision(valid)), valid)
+        invalid = (
+            {**valid, "extra": True},
+            {**valid, "input": "[]"},
+            {**valid, "input": '{"x":NaN}'},
+            {**valid, "input": '{"x":1,"x":2}'},
+            {"kind": "power", "message": "not empty", "power": "hello", "input": "{}"},
+            {"kind": "power", "message": "", "power": "../shell", "input": "{}"},
+        )
+        for decision in invalid:
+            with self.subTest(decision=decision), self.assertRaises(ValueError):
+                self.module._canonical_decision(decision)
 
     def test_provider_environment_drops_capsule_and_service_secrets(self) -> None:
         source = {
