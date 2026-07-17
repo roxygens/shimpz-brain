@@ -27,7 +27,8 @@ class CodexInstrumentTest(unittest.TestCase):
         cls.module = load_script()
 
     def test_command_is_stateless_and_disables_every_agent_surface(self) -> None:
-        command = self.module._command("gpt-test", Path("/tmp/instrument/model-catalog.json"))  # noqa: S108
+        catalog_path = self.module.PROVIDER_WORKDIR / "instrument" / "model-catalog.json"
+        command = self.module._command("gpt-test", catalog_path)
         joined = " ".join(command)
 
         self.assertNotIn("dangerously", joined)
@@ -36,7 +37,7 @@ class CodexInstrumentTest(unittest.TestCase):
         self.assertIn("--ignore-user-config", command)
         self.assertIn("--ignore-rules", command)
         self.assertIn("--ephemeral", command)
-        self.assertEqual(command[command.index("--cd") + 1], "/tmp")  # noqa: S108
+        self.assertEqual(Path(command[command.index("--cd") + 1]), self.module.PROVIDER_WORKDIR)
         self.assertEqual(command[command.index("--output-schema") + 1], str(self.module.DECISION_SCHEMA_PATH))
 
         disabled = {command[index + 1] for index, value in enumerate(command[:-1]) if value == "--disable"}
@@ -87,7 +88,7 @@ class CodexInstrumentTest(unittest.TestCase):
         self.assertIsNone(model["multi_agent_version"])
 
     def test_provider_environment_drops_capsule_secrets_and_uses_fresh_home(self) -> None:
-        home = Path("/tmp/instrument")  # noqa: S108
+        home = self.module.PROVIDER_WORKDIR / "instrument"
         child = self.module._provider_environment(
             {
                 "DATABASE_URL": "postgresql://must-not-leak",
@@ -147,10 +148,7 @@ class CodexInstrumentTest(unittest.TestCase):
                 self.module._event(event)
 
     def test_stream_event_exposes_only_the_canonical_decision(self) -> None:
-        original = (
-            b'{"type":"item.completed","item":{"type":"agent_message",'
-            b'"text":"provider output"}}\n'
-        )
+        original = b'{"type":"item.completed","item":{"type":"agent_message","text":"provider output"}}\n'
         canonical = '{"kind":"message","message":"Hello","power":"","input":"{}"}'
 
         normalized = json.loads(self.module._canonical_event_line(original, canonical))

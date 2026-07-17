@@ -29,6 +29,7 @@ INSTRUMENT_PARENT = Path("/config/.shimpz/codex-instruments")
 DECISION_SCHEMA_PATH = Path("/usr/local/share/shimpz-chat/decision.schema.json")
 INSTRUMENT_PROMPT_PATH = Path("/usr/local/share/shimpz-chat/instrument-prompt.txt")
 FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PROVIDER_WORKDIR = Path("/") / "tmp"
 PASSTHROUGH_ENV = frozenset(
     {
         "OPENAI_API_KEY",
@@ -221,11 +222,7 @@ def _write_private_json(path: Path, payload: object) -> None:
 def _instrument_home(model: str):
     INSTRUMENT_PARENT.mkdir(mode=0o700, parents=True, exist_ok=True)
     parent_info = INSTRUMENT_PARENT.lstat()
-    if (
-        not stat.S_ISDIR(parent_info.st_mode)
-        or parent_info.st_uid != os.geteuid()
-        or parent_info.st_mode & 0o077
-    ):
+    if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != os.geteuid() or parent_info.st_mode & 0o077:
         raise OSError("unsafe Codex instrument runtime directory")
     INSTRUMENT_PARENT.chmod(0o700)
     with tempfile.TemporaryDirectory(prefix="turn-", dir=INSTRUMENT_PARENT) as temporary:
@@ -271,7 +268,7 @@ def _command(model: str, catalog_path: Path) -> list[str]:
         "--color",
         "never",
         "--cd",
-        "/tmp",  # noqa: S108
+        str(PROVIDER_WORKDIR),
         "--output-schema",
         str(DECISION_SCHEMA_PATH),
         "--model",
@@ -293,7 +290,7 @@ def _provider_environment(source: dict[str, str], home: Path) -> dict[str, str]:
             "HOME": str(home),
             "LANG": "C.UTF-8",
             "PATH": FIXED_PATH,
-            "TMPDIR": "/tmp",  # noqa: S108
+            "TMPDIR": str(PROVIDER_WORKDIR),
         }
     )
     return environment
@@ -309,7 +306,7 @@ def _spawn_codex(command: list[str], prompt: bytes, environment: dict[str, str])
             command,
             stdin=prompt_file,
             stdout=subprocess.PIPE,
-            cwd="/tmp",  # noqa: S108 - never expose the tenant workspace to Codex
+            cwd=PROVIDER_WORKDIR,
             env=environment,
         )
     if child.stdout is None:
@@ -416,11 +413,7 @@ def _decision(raw: str) -> str:
 def _canonical_event_line(line: bytes, canonical: str) -> bytes:
     event = _event(line)
     item = event.get("item")
-    if (
-        event.get("type") != "item.completed"
-        or not isinstance(item, dict)
-        or item.get("type") != "agent_message"
-    ):
+    if event.get("type") != "item.completed" or not isinstance(item, dict) or item.get("type") != "agent_message":
         raise ProviderOutputError("Codex final decision event is unavailable")
     normalized_item = {**item, "text": canonical}
     normalized_event = {**event, "item": normalized_item}

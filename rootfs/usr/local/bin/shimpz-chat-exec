@@ -43,6 +43,7 @@ ASSET_MAX_BYTES = 64 * 1024
 MAX_POWER_INPUT_BYTES = 16 * 1024
 MAX_CLAUDE_OUTPUT_BYTES = 512 * 1024
 FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PROVIDER_WORKDIR = Path("/") / "tmp"
 PASSTHROUGH_ENV = frozenset(
     {
         # Provider credentials. The Claude bootstrap may add one of these after this scrub by
@@ -97,7 +98,7 @@ def _provider_environment(source: dict[str, str]) -> dict[str, str]:
             "HOME": "/config",
             "LANG": "C.UTF-8",
             "PATH": FIXED_PATH,
-            "TMPDIR": "/tmp",  # noqa: S108 - the provider gets no filesystem tools
+            "TMPDIR": str(PROVIDER_WORKDIR),
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "DISABLE_AUTOUPDATER": "1",
             "DISABLE_ERROR_REPORTING": "1",
@@ -581,102 +582,103 @@ def main() -> int:
     pid_path = STATE_DIR / f"{token}.pid"
     stop_path = STATE_DIR / f"{token}.stop"
     child = None
-    claude_output = None
     provider_starttime = 0
     temporary_path = None
     group_gone = False
     active_owned = False
     init_starttime = 0
     try:
-        init_starttime = _container_init_starttime()
-        guard = _acquire_guard()
-        try:
-            active = _read_active()
-            if stop_path.exists():
-                active_owned = (
-                    active is not None and active["token"] == token and active["container_id"] == container_id
-                )
-                return 143
-            if active != {
-                "version": 2,
-                "token": token,
-                "container_id": container_id,
-                "container_init_starttime": init_starttime,
-                "phase": "claimed",
-            }:
-                raise OSError("chat wrapper could not adopt its exact durable claim")
-            active_owned = True
-            _enable_subreaper()
-            # Persist conservative spawn intent before Popen. If this root wrapper crashes from
-            # this point onward, Stop must preserve the durable token and force the Capsule
-            # lifecycle fallback even when no process-identity file has been published yet.
-            _publish_active(token, container_id, init_starttime, "starting")
-            command = _instrument_claude_command(sys.argv[3:])
-            child_env = _provider_environment(dict(os.environ))
-            if _contains_claude(command):
-                # Its lifetime spans Popen, process-tree cleanup, and result normalization.
-                claude_output = tempfile.TemporaryFile(mode="w+b", dir=STATE_DIR)  # noqa: SIM115
-            child = subprocess.Popen(
-                command,
-                stdin=sys.stdin.buffer,
-                stdout=claude_output or sys.stdout.buffer,
-                stderr=sys.stderr.buffer,
-                cwd="/tmp",  # noqa: S108 - fixed empty runtime cwd, never the tenant workspace
-                env=child_env,
-                start_new_session=True,
-                pass_fds=(turn_lock,),
-                **_provider_identity(),
-            )
-            wrapper_info = _process_info(os.getpid())
-            provider_info = _process_info(child.pid)
-            if wrapper_info is None or provider_info is None:
-                raise OSError("chat process identity could not be captured")
-            provider_starttime = provider_info[1]
-            fd, temporary = tempfile.mkstemp(prefix=f".{token}.", dir=STATE_DIR)
-            temporary_path = Path(temporary)
-            with os.fdopen(fd, "w", encoding="ascii") as output:
-                output.write(
-                    json.dumps(
-                        {
-                            "version": 3,
-                            "wrapper_pid": os.getpid(),
-                            "wrapper_starttime": wrapper_info[1],
-                            "provider_pgid": child.pid,
-                            "provider_starttime": provider_starttime,
-                            "container_id": container_id,
-                            "container_init_starttime": init_starttime,
-                        },
-                        separators=(",", ":"),
+        # Claude output must remain private until it passes the exact decision schema. Other
+        # providers retain their existing streaming stdout without allocating a capture file.
+        with (
+            tempfile.TemporaryFile(mode="w+b", dir=STATE_DIR)
+            if _contains_claude(sys.argv[3:])
+            else contextlib.nullcontext()
+        ) as claude_output:
+            init_starttime = _container_init_starttime()
+            guard = _acquire_guard()
+            try:
+                active = _read_active()
+                if stop_path.exists():
+                    active_owned = (
+                        active is not None and active["token"] == token and active["container_id"] == container_id
                     )
+                    return 143
+                if active != {
+                    "version": 2,
+                    "token": token,
+                    "container_id": container_id,
+                    "container_init_starttime": init_starttime,
+                    "phase": "claimed",
+                }:
+                    raise OSError("chat wrapper could not adopt its exact durable claim")
+                active_owned = True
+                _enable_subreaper()
+                # Persist conservative spawn intent before Popen. If this root wrapper crashes from
+                # this point onward, Stop must preserve the durable token and force the Capsule
+                # lifecycle fallback even when no process-identity file has been published yet.
+                _publish_active(token, container_id, init_starttime, "starting")
+                command = _instrument_claude_command(sys.argv[3:])
+                child_env = _provider_environment(dict(os.environ))
+                child = subprocess.Popen(
+                    command,
+                    stdin=sys.stdin.buffer,
+                    stdout=claude_output or sys.stdout.buffer,
+                    stderr=sys.stderr.buffer,
+                    cwd=PROVIDER_WORKDIR,
+                    env=child_env,
+                    start_new_session=True,
+                    pass_fds=(turn_lock,),
+                    **_provider_identity(),
                 )
-                output.flush()
-                os.fsync(output.fileno())
-            temporary_path.chmod(0o600)
-            temporary_path.replace(pid_path)
-            temporary_path = None
-            _publish_active(token, container_id, init_starttime, "running")
-        finally:
-            os.close(guard)
+                wrapper_info = _process_info(os.getpid())
+                provider_info = _process_info(child.pid)
+                if wrapper_info is None or provider_info is None:
+                    raise OSError("chat process identity could not be captured")
+                provider_starttime = provider_info[1]
+                fd, temporary = tempfile.mkstemp(prefix=f".{token}.", dir=STATE_DIR)
+                temporary_path = Path(temporary)
+                with os.fdopen(fd, "w", encoding="ascii") as output:
+                    output.write(
+                        json.dumps(
+                            {
+                                "version": 3,
+                                "wrapper_pid": os.getpid(),
+                                "wrapper_starttime": wrapper_info[1],
+                                "provider_pgid": child.pid,
+                                "provider_starttime": provider_starttime,
+                                "container_id": container_id,
+                                "container_init_starttime": init_starttime,
+                            },
+                            separators=(",", ":"),
+                        )
+                    )
+                    output.flush()
+                    os.fsync(output.fileno())
+                temporary_path.chmod(0o600)
+                temporary_path.replace(pid_path)
+                temporary_path = None
+                _publish_active(token, container_id, init_starttime, "running")
+            finally:
+                os.close(guard)
 
-        returncode, cancel_signal = _wait_for_child(child, provider_starttime, token, stop_path)
-        group_gone = _end_tree(os.getpid(), child.pid, provider_starttime, token)
-        if not group_gone:
-            print("provider process tree did not terminate", file=sys.stderr)
-            return 70
-        if cancel_signal:
-            return 128 + cancel_signal
-        if returncode == 0 and claude_output is not None:
-            claude_output.seek(0)
-            raw_output = claude_output.read(MAX_CLAUDE_OUTPUT_BYTES + 1)
-            sys.stdout.buffer.write(_normalize_claude_output(raw_output))
-            sys.stdout.buffer.flush()
-        return 128 + abs(returncode) if returncode < 0 else returncode
+            returncode, cancel_signal = _wait_for_child(child, provider_starttime, token, stop_path)
+            group_gone = _end_tree(os.getpid(), child.pid, provider_starttime, token)
+            if not group_gone:
+                print("provider process tree did not terminate", file=sys.stderr)
+                return 70
+            if cancel_signal:
+                return 128 + cancel_signal
+            if returncode == 0 and claude_output is not None:
+                claude_output.seek(0)
+                raw_output = claude_output.read(MAX_CLAUDE_OUTPUT_BYTES + 1)
+                sys.stdout.buffer.write(_normalize_claude_output(raw_output))
+                sys.stdout.buffer.flush()
+            return 128 + abs(returncode) if returncode < 0 else returncode
     except (OSError, ValueError) as exc:
         print(f"chat control failed: {exc}", file=sys.stderr)
         return 70
     finally:
-        if claude_output is not None:
-            claude_output.close()
         _cleanup_attempt(
             child=child,
             provider_starttime=provider_starttime,

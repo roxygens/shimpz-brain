@@ -131,7 +131,7 @@ class ChatInstrumentTest(unittest.TestCase):
         self.assertEqual(child["HTTPS_PROXY"], "http://egress-proxy:8888")
         self.assertEqual(child["PATH"], self.module.FIXED_PATH)
         self.assertEqual(child["HOME"], "/config")
-        self.assertEqual(child["TMPDIR"], "/tmp")  # noqa: S108
+        self.assertEqual(Path(child["TMPDIR"]), self.module.PROVIDER_WORKDIR)
 
     def test_image_assets_reject_writable_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
