@@ -1,7 +1,0 @@
-#!/usr/bin/with-contenv bash
-# shellcheck shell=bash  # s6-overlay's `with-contenv` wrapper is not a shell ShellCheck recognizes.
-set -euo pipefail
-
-# The desktop service chain is deliberately absent from this image. Run the existing Brain startup
-# under the remapped, unprivileged abc identity as an explicit supervised headless service instead.
-exec s6-setuidgid abc /defaults/autostart
