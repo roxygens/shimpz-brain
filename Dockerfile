@@ -327,6 +327,10 @@ RUN chmod +x /usr/local/bin/* \
              /custom-cont-init.d/*.sh \
              /etc/s6-overlay/s6-rc.d/svc-shimpz-headless/run \
              /defaults/autostart 2>/dev/null || true; \
+    chown root:root /usr/local/share/shimpz-chat/decision.schema.json \
+                    /usr/local/share/shimpz-chat/instrument-prompt.txt && \
+    chmod 0644 /usr/local/share/shimpz-chat/decision.schema.json \
+               /usr/local/share/shimpz-chat/instrument-prompt.txt && \
     # uikey/uitype are the same HTTP-client wrapper as uiclick (branches on argv[0]).
     ln -sf uiclick /usr/local/bin/uikey && \
     ln -sf uiclick /usr/local/bin/uitype && \

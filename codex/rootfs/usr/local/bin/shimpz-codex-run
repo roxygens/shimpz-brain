@@ -1,5 +1,5 @@
 #!/opt/venv/bin/python
-"""Run Codex with stdin prompts and an explicit Capsule-local thread id."""
+"""Run one stateless Codex turn as a tool-free Shimpz Assistant instrument."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import json
 import os
 import re
 import signal
+import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -17,17 +19,73 @@ from typing import BinaryIO
 MAX_PROMPT_BYTES = 128 * 1024
 MAX_OUTPUT_LINE_BYTES = 256 * 1024
 MAX_OUTPUT_BYTES = 2 * 1024 * 1024
-THREAD_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+MAX_AUTH_BYTES = 1024 * 1024
+MAX_POWER_INPUT_BYTES = 16 * 1024
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+POWER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+DEFAULT_MODEL = "gpt-5.2-codex"
+AUTH_PATH = Path("/config/.codex/auth.json")
+INSTRUMENT_PARENT = Path("/config/.shimpz/codex-instruments")
+DECISION_SCHEMA_PATH = Path("/usr/local/share/shimpz-chat/decision.schema.json")
+INSTRUMENT_PROMPT_PATH = Path("/usr/local/share/shimpz-chat/instrument-prompt.txt")
+FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+PASSTHROUGH_ENV = frozenset(
+    {
+        "OPENAI_API_KEY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    }
+)
+DISABLED_FEATURES = (
+    "apps",
+    "artifact",
+    "auth_elicitation",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "code_mode",
+    "code_mode_host",
+    "code_mode_only",
+    "collaboration_modes",
+    "computer_use",
+    "current_time_reminder",
+    "default_mode_request_user_input",
+    "deferred_executor",
+    "enable_mcp_apps",
+    "goals",
+    "hooks",
+    "image_generation",
+    "in_app_browser",
+    "multi_agent",
+    "multi_agent_v2",
+    "plugin_sharing",
+    "plugins",
+    "remote_plugin",
+    "request_permissions_tool",
+    "search_tool",
+    "shell_snapshot",
+    "shell_tool",
+    "skill_mcp_dependency_install",
+    "standalone_web_search",
+    "token_budget",
+    "tool_call_mcp_elicitation",
+    "tool_suggest",
+    "unified_exec",
+    "workspace_dependencies",
+)
+SAFE_ITEM_TYPES = frozenset({"agent_message", "error", "reasoning"})
 
 
 class ProviderOutputError(ValueError):
     """Codex violated the bounded JSONL transport contract."""
-
-
-def _thread_path() -> Path:
-    home = Path(os.environ.get("SHIMPZ_HOME", "/config/.shimpz"))
-    return home / "codex-thread-id"
 
 
 def _read_prompt() -> bytes:
@@ -37,67 +95,226 @@ def _read_prompt() -> bytes:
     return prompt
 
 
-def _read_thread(path: Path) -> str:
+def _read_image_asset(path: Path, limit: int = 64 * 1024) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
-        thread_id = path.read_text(encoding="ascii").strip()
-    except OSError as exc:
-        raise ValueError("no saved session") from exc
-    if not THREAD_RE.fullmatch(thread_id):
-        raise ValueError("no saved session")
-    return thread_id
-
-
-def _write_thread(path: Path, thread_id: str) -> None:
-    if not THREAD_RE.fullmatch(thread_id):
-        raise ValueError("provider returned an invalid thread id")
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
-    fd, temporary = tempfile.mkstemp(prefix=".codex-thread-", dir=path.parent)
-    temporary_path = Path(temporary)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="ascii") as output:
-            output.write(thread_id + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-        temporary_path.replace(path)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_nlink != 1
+            or info.st_size < 1
+            or info.st_size > limit
+            or info.st_mode & 0o022
+        ):
+            raise OSError(f"unsafe Codex instrument asset: {path}")
+        content = os.read(descriptor, limit + 1)
     finally:
-        temporary_path.unlink(missing_ok=True)
+        os.close(descriptor)
+    if len(content) > limit:
+        raise OSError(f"oversized Codex instrument asset: {path}")
+    return content
 
 
-def _command(session: str, thread_path: Path, model: str) -> list[str]:
-    common = ["--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--json"]
-    if model:
-        common.extend(("--model", model))
-    if session == "resume":
-        return ["/usr/local/bin/codex", "exec", "resume", *common, _read_thread(thread_path), "-"]
-    return ["/usr/local/bin/codex", "exec", *common, "--color", "never", "-"]
+def _copy_private_auth(destination: Path) -> None:
+    try:
+        source = os.open(AUTH_PATH, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return
+    try:
+        info = os.fstat(source)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or info.st_size < 1
+            or info.st_size > MAX_AUTH_BYTES
+            or info.st_mode & 0o077
+        ):
+            raise OSError("unsafe Codex authentication cache")
+        target = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            remaining = info.st_size
+            while remaining:
+                chunk = os.read(source, min(remaining, 64 * 1024))
+                if not chunk:
+                    raise OSError("truncated Codex authentication cache")
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(target, view)
+                    view = view[written:]
+                remaining -= len(chunk)
+            os.fsync(target)
+        finally:
+            os.close(target)
+    finally:
+        os.close(source)
 
 
-def _spawn_codex(command: list[str], prompt: bytes) -> tuple[int, BinaryIO]:
-    """Fork the fixed Codex binary; a memfd avoids pipe deadlock while stdout streams."""
-    prompt_fd = os.memfd_create("shimpz-codex-prompt", os.MFD_CLOEXEC)
-    written = 0
-    while written < len(prompt):
-        written += os.write(prompt_fd, prompt[written:])
-    os.lseek(prompt_fd, 0, os.SEEK_SET)
-    parent_stdout, child_stdout = os.pipe()
-    actions = (
-        (os.POSIX_SPAWN_DUP2, prompt_fd, sys.stdin.fileno()),
-        (os.POSIX_SPAWN_DUP2, child_stdout, sys.stdout.fileno()),
-        (os.POSIX_SPAWN_CLOSE, prompt_fd),
-        (os.POSIX_SPAWN_CLOSE, parent_stdout),
-        (os.POSIX_SPAWN_CLOSE, child_stdout),
+def _model_catalog(model: str, instructions: str) -> dict[str, object]:
+    """Build the authoritative ModelInfo used by pinned Codex 0.144.3."""
+    return {
+        "models": [
+            {
+                "slug": model,
+                "display_name": "Shimpz Instrument",
+                "description": "Tool-free Assistant decision runtime",
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [
+                    {"effort": "low", "description": "Fast decisions"},
+                    {"effort": "medium", "description": "Balanced decisions"},
+                    {"effort": "high", "description": "Complex decisions"},
+                ],
+                "shell_type": "disabled",
+                "visibility": "list",
+                "supported_in_api": True,
+                "priority": 1,
+                "availability_nux": None,
+                "upgrade": None,
+                "base_instructions": instructions,
+                "include_skills_usage_instructions": False,
+                "supports_reasoning_summaries": False,
+                "default_reasoning_summary": "none",
+                "support_verbosity": False,
+                "default_verbosity": None,
+                "apply_patch_tool_type": None,
+                "web_search_tool_type": "text",
+                "truncation_policy": {"mode": "tokens", "limit": 10000},
+                "supports_parallel_tool_calls": False,
+                "supports_image_detail_original": False,
+                "context_window": 128000,
+                "max_context_window": 128000,
+                "auto_compact_token_limit": None,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text"],
+                "supports_search_tool": False,
+                "use_responses_lite": False,
+                "auto_review_model_override": None,
+                "tool_mode": None,
+                "multi_agent_version": None,
+            }
+        ]
+    }
+
+
+def _write_private_json(path: Path, payload: object) -> None:
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
     )
     try:
-        pid = os.posix_spawn(command[0], command, os.environ, file_actions=actions)
-    except OSError:
-        os.close(parent_stdout)
-        raise
+        content = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        written = 0
+        while written < len(content):
+            written += os.write(descriptor, content[written:])
+        os.fsync(descriptor)
     finally:
-        os.close(prompt_fd)
-        os.close(child_stdout)
-    return pid, os.fdopen(parent_stdout, "rb")
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def _instrument_home(model: str):
+    INSTRUMENT_PARENT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_info = INSTRUMENT_PARENT.lstat()
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != os.geteuid()
+        or parent_info.st_mode & 0o077
+    ):
+        raise OSError("unsafe Codex instrument runtime directory")
+    INSTRUMENT_PARENT.chmod(0o700)
+    with tempfile.TemporaryDirectory(prefix="turn-", dir=INSTRUMENT_PARENT) as temporary:
+        home = Path(temporary)
+        home.chmod(0o700)
+        _copy_private_auth(home / "auth.json")
+        instructions = _read_image_asset(INSTRUMENT_PROMPT_PATH).decode("utf-8").strip()
+        # Validate the shared schema before handing its root-owned path to Codex.
+        json.loads(_read_image_asset(DECISION_SCHEMA_PATH))
+        catalog_path = home / "model-catalog.json"
+        _write_private_json(catalog_path, _model_catalog(model, instructions))
+        yield home, catalog_path
+
+
+def _command(model: str, catalog_path: Path) -> list[str]:
+    config = (
+        f"model_catalog_json={json.dumps(str(catalog_path))}",
+        f"model_instructions_file={json.dumps(str(INSTRUMENT_PROMPT_PATH))}",
+        'default_permissions="instrument"',
+        "permissions.instrument={}",
+        'web_search="disabled"',
+        "mcp_servers={}",
+        "plugins={}",
+        "skills={}",
+        "orchestrator.mcp.enabled=false",
+        "orchestrator.skills.enabled=false",
+        "include_apps_instructions=false",
+        "include_collaboration_mode_instructions=false",
+        "include_environment_context=false",
+        "include_permissions_instructions=false",
+        'personality="none"',
+        "check_for_update_on_startup=false",
+    )
+    command = [
+        "/usr/local/bin/codex",
+        "exec",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--strict-config",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--json",
+        "--color",
+        "never",
+        "--cd",
+        "/tmp",  # noqa: S108
+        "--output-schema",
+        str(DECISION_SCHEMA_PATH),
+        "--model",
+        model,
+    ]
+    for feature in DISABLED_FEATURES:
+        command.extend(("--disable", feature))
+    for override in config:
+        command.extend(("--config", override))
+    command.append("-")
+    return command
+
+
+def _provider_environment(source: dict[str, str], home: Path) -> dict[str, str]:
+    environment = {name: source[name] for name in PASSTHROUGH_ENV if source.get(name)}
+    environment.update(
+        {
+            "CODEX_HOME": str(home),
+            "HOME": str(home),
+            "LANG": "C.UTF-8",
+            "PATH": FIXED_PATH,
+            "TMPDIR": "/tmp",  # noqa: S108
+        }
+    )
+    return environment
+
+
+def _spawn_codex(command: list[str], prompt: bytes, environment: dict[str, str]) -> tuple[int, BinaryIO]:
+    """Fork the fixed Codex binary; an unlinked private file avoids pipe deadlock."""
+    with tempfile.TemporaryFile(mode="w+b", dir=environment["CODEX_HOME"]) as prompt_file:
+        prompt_file.write(prompt)
+        prompt_file.flush()
+        prompt_file.seek(0)
+        child = subprocess.Popen(
+            command,
+            stdin=prompt_file,
+            stdout=subprocess.PIPE,
+            cwd="/tmp",  # noqa: S108 - never expose the tenant workspace to Codex
+            env=environment,
+        )
+    if child.stdout is None:
+        raise OSError("Codex stdout is unavailable")
+    return child.pid, child.stdout
 
 
 def _bounded_lines(provider_output: BinaryIO):
@@ -119,6 +336,95 @@ def _bounded_lines(provider_output: BinaryIO):
         raise ProviderOutputError("Codex output line exceeded its size limit")
     if buffered:
         yield buffered
+
+
+def _event(line: bytes) -> dict[str, object]:
+    try:
+        event = _strict_json(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ProviderOutputError("Codex returned invalid JSONL") from exc
+    if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+        raise ProviderOutputError("Codex returned an invalid event")
+    item = event.get("item")
+    if item is not None and (not isinstance(item, dict) or item.get("type") not in SAFE_ITEM_TYPES):
+        item_type = item.get("type") if isinstance(item, dict) else "invalid"
+        raise ProviderOutputError(f"Codex attempted a forbidden tool event: {item_type}")
+    return event
+
+
+def _strict_json(raw: str):
+    def reject_constant(value: str):
+        raise ValueError(f"invalid JSON constant: {value}")
+
+    def reject_duplicate_keys(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key: {key}")
+            value[key] = item
+        return value
+
+    return json.loads(raw, parse_constant=reject_constant, object_pairs_hook=reject_duplicate_keys)
+
+
+def _decision(raw: str) -> str:
+    try:
+        decision = _strict_json(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ProviderOutputError("Codex returned an invalid Assistant decision") from exc
+    if not isinstance(decision, dict) or set(decision) != {"kind", "message", "power", "input"}:
+        raise ProviderOutputError("Codex returned an invalid Assistant decision")
+    kind = decision["kind"]
+    message = decision["message"]
+    power = decision["power"]
+    encoded_input = decision["input"]
+    if (
+        kind not in {"message", "power"}
+        or not isinstance(message, str)
+        or len(message) > 32000
+        or not isinstance(power, str)
+        or len(power) > 128
+        or not isinstance(encoded_input, str)
+        or len(encoded_input.encode("utf-8")) > MAX_POWER_INPUT_BYTES
+    ):
+        raise ProviderOutputError("Codex returned an invalid Assistant decision")
+    try:
+        power_input = _strict_json(encoded_input)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ProviderOutputError("Codex returned an invalid Power input") from exc
+    if not isinstance(power_input, dict):
+        raise ProviderOutputError("Codex returned a non-object Power input")
+    canonical_input = json.dumps(
+        power_input,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(canonical_input.encode("utf-8")) > MAX_POWER_INPUT_BYTES:
+        raise ProviderOutputError("Codex returned an oversized Power input")
+    if kind == "message" and (not message or power or power_input):
+        raise ProviderOutputError("Codex returned an invalid direct message decision")
+    if kind == "power" and (message or POWER_RE.fullmatch(power) is None):
+        raise ProviderOutputError("Codex returned an invalid Power decision")
+    return json.dumps(
+        {"kind": kind, "message": message, "power": power, "input": canonical_input},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _canonical_event_line(line: bytes, canonical: str) -> bytes:
+    event = _event(line)
+    item = event.get("item")
+    if (
+        event.get("type") != "item.completed"
+        or not isinstance(item, dict)
+        or item.get("type") != "agent_message"
+    ):
+        raise ProviderOutputError("Codex final decision event is unavailable")
+    normalized_item = {**item, "text": canonical}
+    normalized_event = {**event, "item": normalized_item}
+    return (json.dumps(normalized_event, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def _terminate_child(pid: int) -> int:
@@ -150,57 +456,72 @@ def main() -> int:
     if invocation is None:
         print("usage: shimpz-codex-run new|resume text|json [--model MODEL]", file=sys.stderr)
         return 64
-    session, output_format, model = invocation
+    _session, output_format, configured_model = invocation
+    model = configured_model or DEFAULT_MODEL
     try:
         prompt = _read_prompt()
-        thread_path = _thread_path()
-        command = _command(session, thread_path, model)
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 66
 
     try:
-        pid, provider_output = _spawn_codex(command, prompt)
-    except OSError as exc:
-        print(f"could not start Codex: {exc}", file=sys.stderr)
-        return 70
-    final_message = ""
-    status = None
-    transport_failed = False
-    try:
-        with provider_output:
-            for line in _bounded_lines(provider_output):
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    event = None
-                if isinstance(event, dict) and event.get("type") == "thread.started":
-                    thread_id = event.get("thread_id")
-                    if isinstance(thread_id, str):
-                        _write_thread(thread_path, thread_id)
-                item = event.get("item") if isinstance(event, dict) else None
-                if (
-                    isinstance(item, dict)
-                    and event.get("type") == "item.completed"
-                    and item.get("type") == "agent_message"
-                    and isinstance(item.get("text"), str)
-                ):
-                    final_message = item["text"]
-                if output_format == "json":
+        with _instrument_home(model) as (home, catalog_path):
+            command = _command(model, catalog_path)
+            environment = _provider_environment(dict(os.environ), home)
+            try:
+                pid, provider_output = _spawn_codex(command, prompt, environment)
+            except OSError as exc:
+                print(f"could not start Codex: {exc}", file=sys.stderr)
+                return 70
+            final_message = ""
+            final_line_index = None
+            lines: list[bytes] = []
+            status = None
+            transport_failed = False
+            try:
+                with provider_output:
+                    for line in _bounded_lines(provider_output):
+                        event = _event(line)
+                        item = event.get("item")
+                        if (
+                            isinstance(item, dict)
+                            and event.get("type") == "item.completed"
+                            and item.get("type") == "agent_message"
+                            and isinstance(item.get("text"), str)
+                        ):
+                            final_message = item["text"]
+                            final_line_index = len(lines)
+                        lines.append(line)
+            except (OSError, ProviderOutputError, ValueError) as exc:
+                print(str(exc), file=sys.stderr)
+                transport_failed = True
+                status = _terminate_child(pid)
+            if status is None:
+                _waited, status = os.waitpid(pid, 0)
+            returncode = os.waitstatus_to_exitcode(status)
+            if transport_failed:
+                return 70
+            if returncode != 0:
+                return 128 + abs(returncode) if returncode < 0 else returncode
+            try:
+                canonical = _decision(final_message)
+            except ProviderOutputError as exc:
+                print(str(exc), file=sys.stderr)
+                return 70
+            if output_format == "json":
+                if final_line_index is None:
+                    print("Codex final decision event is unavailable", file=sys.stderr)
+                    return 70
+                lines[final_line_index] = _canonical_event_line(lines[final_line_index], canonical)
+                for line in lines:
                     sys.stdout.buffer.write(line)
-                    sys.stdout.buffer.flush()
-    except (OSError, ProviderOutputError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
-        transport_failed = True
-        status = _terminate_child(pid)
-    if status is None:
-        _waited, status = os.waitpid(pid, 0)
-    returncode = os.waitstatus_to_exitcode(status)
-    if transport_failed:
+                sys.stdout.buffer.flush()
+            else:
+                print(canonical)
+            return 0
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"could not secure Codex instrument runtime: {exc}", file=sys.stderr)
         return 70
-    if output_format == "text" and final_message:
-        print(final_message)
-    return 128 + abs(returncode) if returncode < 0 else returncode
 
 
 if __name__ == "__main__":
