@@ -27,6 +27,10 @@ RUN set -eux; \
     echo "${UV_INSTALL_SHA256}  /tmp/uv-install.sh" | sha256sum -c -; \
     env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh /tmp/uv-install.sh; \
     rm -f /tmp/uv-install.sh; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/* /var/lib/apt/periodic/* /var/cache/apt/* /var/cache/fontconfig/* \
+        /var/cache/ldconfig/aux-cache /var/cache/man/* /var/log/apt/* /var/log/alternatives.log \
+        /var/log/dpkg.log; \
     uv --version
 
 WORKDIR /build
