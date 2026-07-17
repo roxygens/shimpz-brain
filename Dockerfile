@@ -35,11 +35,11 @@ RUN set -eux; \
 
 WORKDIR /build
 COPY pyproject.toml uv.lock ./
-RUN UV_PROJECT_ENVIRONMENT=/opt/venv UV_CACHE_DIR=/tmp/uv-cache UV_LINK_MODE=copy \
+RUN export UV_PROJECT_ENVIRONMENT=/opt/venv UV_CACHE_DIR=/tmp/uv-cache UV_LINK_MODE=copy; \
     uv sync --frozen --no-install-project --no-dev --python 3.14 \
     && find /opt/venv -type f -name '*.pyc' -delete \
     && /opt/venv/bin/python -m compileall -q -f --invalidation-mode checked-hash /opt/venv \
-    && rm -rf /tmp/uv-cache /root/.cache/uv
+    && rm -rf "${UV_CACHE_DIR}" /root/.cache/uv
 
 FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1
 ARG SOURCE_DATE_EPOCH=0
