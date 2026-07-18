@@ -185,7 +185,7 @@ def provider_model(config: ProviderConfig) -> BaseChatModel:
         "max_retries": 2,
     }
     if config.provider == "openai":
-        return ChatOpenAI(**common)
+        return ChatOpenAI(**common, use_responses_api=True)
     if config.provider == "anthropic":
         return ChatAnthropic(**common)
     raise RuntimeContractError("unsupported model provider")

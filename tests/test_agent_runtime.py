@@ -6,6 +6,7 @@ import unittest
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
+from unittest import mock
 
 import agent_runtime
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
@@ -258,6 +259,30 @@ class AgentRuntimeTests(unittest.TestCase):
                 self.assertRaisesRegex(agent_runtime.RuntimeContractError, "unsupported model for provider"),
             ):
                 agent_runtime.ProviderConfig(provider=provider, model=model, api_key="secret-test-key")
+
+    def test_openai_uses_responses_api_without_changing_anthropic(self):
+        with (
+            mock.patch.object(agent_runtime, "ChatOpenAI") as openai,
+            mock.patch.object(agent_runtime, "ChatAnthropic") as anthropic,
+        ):
+            agent_runtime.provider_model(
+                agent_runtime.ProviderConfig(
+                    provider="openai",
+                    model="gpt-5.6-terra",
+                    api_key="secret-test-key",
+                )
+            )
+            agent_runtime.provider_model(
+                agent_runtime.ProviderConfig(
+                    provider="anthropic",
+                    model="claude-sonnet-5",
+                    api_key="secret-test-key",
+                )
+            )
+
+        self.assertTrue(openai.call_args.kwargs["use_responses_api"])
+        self.assertNotIn("use_responses_api", anthropic.call_args.kwargs)
+        self.assertEqual(set(openai.call_args.kwargs) - {"use_responses_api"}, set(anthropic.call_args.kwargs))
 
     def test_team_name_and_team_bounds_fail_closed(self):
         for invalid_name in ("", "   ", "Bad\nName", "Bad\x7fName", "x" * 81):
