@@ -153,6 +153,22 @@ class AgentRuntimeTests(unittest.TestCase):
             ],
         )
 
+    def test_model_accepts_one_hundred_powers_across_ten_assistants(self):
+        model = ToolAwareFakeModel(responses=[AIMessage(content="Done")])
+        runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)
+        assistants = tuple(
+            assistant(
+                f"relay-{assistant_index:02d}",
+                *(power(f"power-{power_index:02d}") for power_index in range(1, 11)),
+            )
+            for assistant_index in range(1, 11)
+        )
+
+        runtime.start(context(*assistants), "Run the relay")
+
+        self.assertEqual(len(ToolAwareFakeModel.bound_tools), 100)
+        self.assertEqual(len(set(ToolAwareFakeModel.bound_tools)), 100)
+
     def test_conversations_are_isolated_by_thread(self):
         model = ToolAwareFakeModel(responses=[AIMessage(content="First capsule"), AIMessage(content="Second capsule")])
         saver = InMemorySaver()
@@ -198,12 +214,13 @@ class AgentRuntimeTests(unittest.TestCase):
             context(
                 assistant(
                     "busy-helper-one",
-                    *(power(f"power-{index}") for index in range(agent_runtime.MAX_POWERS // 2)),
+                    *(power(f"power-{index}") for index in range(agent_runtime.MAX_POWERS_PER_ASSISTANT)),
                 ),
                 assistant(
                     "busy-helper-two",
-                    *(power(f"power-{index}") for index in range(agent_runtime.MAX_POWERS // 2 + 1)),
+                    *(power(f"power-{index}") for index in range(agent_runtime.MAX_POWERS_PER_ASSISTANT)),
                 ),
+                assistant("busy-helper-three", power("overflow")),
             )
 
     def test_provider_failures_do_not_expose_the_secret(self):

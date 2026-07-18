@@ -30,7 +30,8 @@ POWER_ID_RE = re.compile(r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\Z")
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 TEAM_NAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 MAX_ASSISTANTS = 16
-MAX_POWERS = 64
+MAX_POWERS_PER_ASSISTANT = 64
+MAX_TEAM_POWERS = 128
 MAX_TEAM_NAME_CHARS = 80
 MAX_RULES_CHARS = 64 * 1024
 MAX_MESSAGE_CHARS = 64 * 1024
@@ -107,7 +108,7 @@ class AssistantDefinition:
             raise RuntimeContractError("invalid Assistant id")
         if not self.rules.strip() or len(self.rules) > MAX_RULES_CHARS:
             raise RuntimeContractError("invalid Assistant Rules")
-        if len(self.powers) > MAX_POWERS:
+        if len(self.powers) > MAX_POWERS_PER_ASSISTANT:
             raise RuntimeContractError("an Assistant exposes too many Powers")
         ids = [power.id for power in self.powers]
         if len(ids) != len(set(ids)):
@@ -130,7 +131,7 @@ class TurnContext:
         assistant_ids = [assistant.id for assistant in self.assistants]
         if len(assistant_ids) != len(set(assistant_ids)):
             raise RuntimeContractError("duplicate Assistant id")
-        if sum(len(assistant.powers) for assistant in self.assistants) > MAX_POWERS:
+        if sum(len(assistant.powers) for assistant in self.assistants) > MAX_TEAM_POWERS:
             raise RuntimeContractError("a Team exposes too many Powers")
 
 

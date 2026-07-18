@@ -44,7 +44,7 @@ class AssistantInput(BaseModel):
 
     id: str = Field(min_length=1, max_length=128)
     rules: str = Field(min_length=1, max_length=agent_runtime.MAX_RULES_CHARS)
-    powers: list[PowerInput] = Field(max_length=agent_runtime.MAX_POWERS)
+    powers: list[PowerInput] = Field(max_length=agent_runtime.MAX_POWERS_PER_ASSISTANT)
 
 
 class TurnContextInput(BaseModel):
@@ -64,7 +64,7 @@ class TurnContextInput(BaseModel):
 
     @model_validator(mode="after")
     def bound_total_powers(self) -> Self:
-        if sum(len(assistant.powers) for assistant in self.assistants) > agent_runtime.MAX_POWERS:
+        if sum(len(assistant.powers) for assistant in self.assistants) > agent_runtime.MAX_TEAM_POWERS:
             raise ValueError("a Team exposes too many Powers")
         return self
 
@@ -101,7 +101,7 @@ class StartTurnInput(TurnContextInput):
 
 
 class ResumeTurnInput(TurnContextInput):
-    results: dict[str, Any] = Field(min_length=1, max_length=agent_runtime.MAX_POWERS)
+    results: dict[str, Any] = Field(min_length=1, max_length=agent_runtime.MAX_TEAM_POWERS)
 
 
 class RuntimeLike:
