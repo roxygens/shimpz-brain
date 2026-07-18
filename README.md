@@ -1,7 +1,7 @@
 # shimpz-brain
 
-The isolated, provider-neutral Brain runtime for a Shimpz Capsule. It uses LangGraph to orchestrate
-one Team's internal Assistants and suspends before every requested Power; the Capsule Controller
+The isolated, provider-neutral Brain runtime for a Shimpz Team. It uses LangGraph to orchestrate
+one Team's internal Assistants and suspends before every requested Power; the Team Controller
 remains responsible for authorization, approval, execution and audit.
 
 `docker build .` produces a small Python 3.14 image running `runtime_api:app` as a non-root user. The

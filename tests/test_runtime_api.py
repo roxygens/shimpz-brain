@@ -15,7 +15,7 @@ SECRET = secrets.token_urlsafe(32)
 
 def body(**updates):
     value = {
-        "thread_id": "capsule:hello-pulse:conversation-1",
+        "thread_id": "team:hello-pulse:conversation-1",
         "team_name": "  Greeting Crew  ",
         "assistants": [
             {
@@ -177,7 +177,7 @@ class RuntimeApiTests(unittest.TestCase):
     def test_thread_deletion_is_authenticated_idempotent_and_closed(self):
         runtime = FakeRuntime()
         api = client(runtime)
-        payload = {"thread_id": "capsule:hello-pulse:conversation-1"}
+        payload = {"thread_id": "team:hello-pulse:conversation-1"}
 
         self.assertEqual(api.post("/v1/threads/delete", json=payload).status_code, 401)
         self.assertEqual(runtime.calls, [])
@@ -270,7 +270,7 @@ class RuntimeApiTests(unittest.TestCase):
         runtime = FakeRuntime(error=agent_runtime.RuntimeStateError(f"failed to delete {SECRET}"))
         response = client(runtime).post(
             "/v1/threads/delete",
-            json={"thread_id": "capsule:hello-pulse:conversation-1"},
+            json={"thread_id": "team:hello-pulse:conversation-1"},
             headers={"Authorization": f"Bearer {TOKEN}"},
         )
 

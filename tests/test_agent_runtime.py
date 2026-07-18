@@ -179,15 +179,15 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(len(set(ToolAwareFakeModel.bound_tools)), 100)
 
     def test_conversations_are_isolated_by_thread(self):
-        model = ToolAwareFakeModel(responses=[AIMessage(content="First capsule"), AIMessage(content="Second capsule")])
+        model = ToolAwareFakeModel(responses=[AIMessage(content="First team"), AIMessage(content="Second team")])
         saver = InMemorySaver()
         runtime = agent_runtime.AgentRuntime(saver, model_factory=lambda _config: model)
 
-        runtime.start(context(thread_id="cap-a:hello:one"), "A")
-        runtime.start(context(thread_id="cap-b:hello:one"), "B")
+        runtime.start(context(thread_id="team-a:hello:one"), "A")
+        runtime.start(context(thread_id="team-b:hello:one"), "B")
 
-        first = saver.get({"configurable": {"thread_id": "cap-a:hello:one"}})
-        second = saver.get({"configurable": {"thread_id": "cap-b:hello:one"}})
+        first = saver.get({"configurable": {"thread_id": "team-a:hello:one"}})
+        second = saver.get({"configurable": {"thread_id": "team-b:hello:one"}})
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
         self.assertNotEqual(
@@ -196,20 +196,20 @@ class AgentRuntimeTests(unittest.TestCase):
         )
 
     def test_delete_thread_removes_only_the_selected_durable_conversation(self):
-        model = ToolAwareFakeModel(responses=[AIMessage(content="First capsule"), AIMessage(content="Second capsule")])
+        model = ToolAwareFakeModel(responses=[AIMessage(content="First team"), AIMessage(content="Second team")])
         with tempfile.TemporaryDirectory() as directory:
             connection = sqlite3.connect(Path(directory) / "checkpoints.sqlite3", check_same_thread=False)
             saver = SqliteSaver(connection)
             saver.setup()
             runtime = agent_runtime.AgentRuntime(saver, model_factory=lambda _config: model)
 
-            runtime.start(context(thread_id="cap-a:hello:one"), "A")
-            runtime.start(context(thread_id="cap-b:hello:one"), "B")
-            runtime.delete_thread("cap-a:hello:one")
-            runtime.delete_thread("cap-a:hello:one")
+            runtime.start(context(thread_id="team-a:hello:one"), "A")
+            runtime.start(context(thread_id="team-b:hello:one"), "B")
+            runtime.delete_thread("team-a:hello:one")
+            runtime.delete_thread("team-a:hello:one")
 
-            self.assertIsNone(saver.get({"configurable": {"thread_id": "cap-a:hello:one"}}))
-            self.assertIsNotNone(saver.get({"configurable": {"thread_id": "cap-b:hello:one"}}))
+            self.assertIsNone(saver.get({"configurable": {"thread_id": "team-a:hello:one"}}))
+            self.assertIsNotNone(saver.get({"configurable": {"thread_id": "team-b:hello:one"}}))
             runtime.close()
 
     def test_delete_thread_rejects_invalid_identifiers_before_checkpoint_access(self):

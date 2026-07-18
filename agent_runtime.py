@@ -1,7 +1,7 @@
 """Provider-neutral LangGraph runtime with no Power execution authority.
 
 The runtime can reason, remember a conversation and request a declared Power.  A Power
-request always suspends the graph before any side effect.  The Capsule Controller remains
+request always suspends the graph before any side effect.  The Team Controller remains
 the only component allowed to validate approvals, execute the Power and resume the graph
 with its bounded result.
 """
