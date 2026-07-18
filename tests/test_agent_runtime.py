@@ -59,6 +59,14 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.reply, "Hello, Captain.")
         self.assertEqual(result.powers, ())
 
+    def test_system_prompt_makes_powers_optional_and_requires_a_natural_reply(self):
+        prompt = agent_runtime._system_prompt(context())
+
+        self.assertIn("Respond naturally to the user by default", prompt)
+        self.assertIn("never request one merely because it is available", prompt)
+        self.assertIn("always synthesize a natural user-facing response", prompt)
+        self.assertIn("instead of returning the raw result", prompt)
+
     def test_power_suspends_before_execution_and_resumes_with_controller_result(self):
         model = ToolAwareFakeModel(
             responses=[
