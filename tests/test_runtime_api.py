@@ -51,7 +51,7 @@ def body(**updates):
                 ],
             },
         ],
-        "provider": {"provider": "openai", "model": "gpt-test", "api_key": SECRET},
+        "provider": {"provider": "openai", "model": "gpt-5.6-terra", "api_key": SECRET},
         "message": "Hello",
     }
     value.update(updates)
@@ -219,6 +219,28 @@ class RuntimeApiTests(unittest.TestCase):
         invalid["assistants"][0]["unexpected"] = "forbidden"
         response = api.post("/v1/turns", json=invalid, headers={"Authorization": f"Bearer {TOKEN}"})
         self.assertEqual(response.status_code, 422)
+
+    def test_unknown_and_cross_provider_models_fail_before_runtime(self):
+        runtime = FakeRuntime()
+        api = client(runtime)
+
+        for provider, model in (
+            ("openai", "gpt-well-formed-but-unknown"),
+            ("openai", "claude-sonnet-5"),
+            ("anthropic", "gpt-5.6-terra"),
+        ):
+            payload = body()
+            payload["provider"] = {"provider": provider, "model": model, "api_key": SECRET}
+            with self.subTest(provider=provider, model=model):
+                response = api.post(
+                    "/v1/turns",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {TOKEN}"},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json(), {"detail": "unsupported model for provider"})
+
+        self.assertEqual(runtime.calls, [])
 
     def test_malformed_team_names_fail_at_the_closed_http_contract(self):
         api = client(FakeRuntime())

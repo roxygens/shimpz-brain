@@ -24,7 +24,18 @@ from langchain_openai import ChatOpenAI
 from langgraph.types import Command, interrupt
 from pydantic import SecretStr
 
-PROVIDERS = frozenset({"anthropic", "openai"})
+MODELS_BY_PROVIDER = {
+    "openai": frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"}),
+    "anthropic": frozenset(
+        {
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "claude-haiku-4-5-20251001",
+        }
+    ),
+}
+PROVIDERS = frozenset(MODELS_BY_PROVIDER)
 APPROVALS = frozenset({"none", "once", "each-run"})
 POWER_ID_RE = re.compile(r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\Z")
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
@@ -71,8 +82,8 @@ class ProviderConfig:
     def __post_init__(self) -> None:
         if self.provider not in PROVIDERS:
             raise RuntimeContractError("unsupported model provider")
-        if IDENTIFIER_RE.fullmatch(self.model) is None:
-            raise RuntimeContractError("invalid model identifier")
+        if self.model not in MODELS_BY_PROVIDER[self.provider]:
+            raise RuntimeContractError("unsupported model for provider")
         if not self.api_key or len(self.api_key) > 16 * 1024 or "\0" in self.api_key:
             raise RuntimeContractError("invalid model provider credential")
 

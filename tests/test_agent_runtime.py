@@ -59,7 +59,11 @@ def context(
         thread_id=thread_id,
         team_name=team_name,
         assistants=tuple(assistants or (assistant("hello-pulse", power()),)),
-        provider=agent_runtime.ProviderConfig(provider="openai", model="gpt-test", api_key="secret-test-key"),
+        provider=agent_runtime.ProviderConfig(
+            provider="openai",
+            model="gpt-5.6-terra",
+            api_key="secret-test-key",
+        ),
     )
 
 
@@ -232,6 +236,28 @@ class AgentRuntimeTests(unittest.TestCase):
                 summary="Hello",
                 input_schema={"type": "string"},
             )
+
+    def test_provider_models_are_closed_to_the_supported_pair(self):
+        for provider, models in agent_runtime.MODELS_BY_PROVIDER.items():
+            for model in models:
+                with self.subTest(provider=provider, model=model):
+                    config = agent_runtime.ProviderConfig(
+                        provider=provider,
+                        model=model,
+                        api_key="secret-test-key",
+                    )
+                    self.assertEqual((config.provider, config.model), (provider, model))
+
+        for provider, model in (
+            ("openai", "gpt-well-formed-but-unknown"),
+            ("openai", "claude-sonnet-5"),
+            ("anthropic", "gpt-5.6-terra"),
+        ):
+            with (
+                self.subTest(provider=provider, model=model),
+                self.assertRaisesRegex(agent_runtime.RuntimeContractError, "unsupported model for provider"),
+            ):
+                agent_runtime.ProviderConfig(provider=provider, model=model, api_key="secret-test-key")
 
     def test_team_name_and_team_bounds_fail_closed(self):
         for invalid_name in ("", "   ", "Bad\nName", "Bad\x7fName", "x" * 81):
