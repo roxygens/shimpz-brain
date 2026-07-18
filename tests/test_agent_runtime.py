@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import sqlite3
+import tempfile
 import unittest
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, ClassVar
 
 import agent_runtime
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 
 class ToolAwareFakeModel(FakeMessagesListChatModel):
@@ -185,6 +189,37 @@ class AgentRuntimeTests(unittest.TestCase):
             first["channel_values"]["messages"][0].content,
             second["channel_values"]["messages"][0].content,
         )
+
+    def test_delete_thread_removes_only_the_selected_durable_conversation(self):
+        model = ToolAwareFakeModel(responses=[AIMessage(content="First capsule"), AIMessage(content="Second capsule")])
+        with tempfile.TemporaryDirectory() as directory:
+            connection = sqlite3.connect(Path(directory) / "checkpoints.sqlite3", check_same_thread=False)
+            saver = SqliteSaver(connection)
+            saver.setup()
+            runtime = agent_runtime.AgentRuntime(saver, model_factory=lambda _config: model)
+
+            runtime.start(context(thread_id="cap-a:hello:one"), "A")
+            runtime.start(context(thread_id="cap-b:hello:one"), "B")
+            runtime.delete_thread("cap-a:hello:one")
+            runtime.delete_thread("cap-a:hello:one")
+
+            self.assertIsNone(saver.get({"configurable": {"thread_id": "cap-a:hello:one"}}))
+            self.assertIsNotNone(saver.get({"configurable": {"thread_id": "cap-b:hello:one"}}))
+            runtime.close()
+
+    def test_delete_thread_rejects_invalid_identifiers_before_checkpoint_access(self):
+        class RejectUnexpectedDelete(InMemorySaver):
+            def delete_thread(self, thread_id: str) -> None:
+                raise AssertionError(f"unexpected deletion: {thread_id}")
+
+        runtime = agent_runtime.AgentRuntime(RejectUnexpectedDelete())
+
+        for thread_id in ("", "bad thread", "x" * 257):
+            with (
+                self.subTest(thread_id=thread_id),
+                self.assertRaisesRegex(agent_runtime.RuntimeContractError, "invalid conversation thread"),
+            ):
+                runtime.delete_thread(thread_id)
 
     def test_invalid_or_duplicate_local_power_contract_fails_closed(self):
         with self.assertRaisesRegex(agent_runtime.RuntimeContractError, "invalid Power id"):

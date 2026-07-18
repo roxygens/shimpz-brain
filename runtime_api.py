@@ -104,6 +104,19 @@ class ResumeTurnInput(TurnContextInput):
     results: dict[str, Any] = Field(min_length=1, max_length=agent_runtime.MAX_TEAM_POWERS)
 
 
+class DeleteThreadInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    thread_id: str = Field(min_length=1, max_length=256)
+
+    @field_validator("thread_id")
+    @classmethod
+    def validate_thread_id(cls, value: str) -> str:
+        if agent_runtime.IDENTIFIER_RE.fullmatch(value) is None:
+            raise ValueError("invalid conversation thread")
+        return value
+
+
 class RuntimeLike:
     """Structural documentation for the injected runtime used by the API and tests."""
 
@@ -114,6 +127,8 @@ class RuntimeLike:
         context: agent_runtime.TurnContext,
         results: Mapping[str, object],
     ) -> agent_runtime.TurnResult: ...
+
+    def delete_thread(self, thread_id: str) -> None: ...
 
 
 TokenReader = Callable[[], str]
@@ -164,6 +179,10 @@ def _response(result: agent_runtime.TurnResult) -> dict[str, object]:
     }
 
 
+async def _state_error_response(_request, _exc: agent_runtime.RuntimeStateError) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": "Brain runtime state operation failed"})
+
+
 def create_app(
     *,
     runtime: RuntimeLike | None = None,
@@ -188,6 +207,7 @@ def create_app(
     )
     app.state.runtime = runtime
     app.state.runtime_lock = threading.Lock()
+    app.add_exception_handler(agent_runtime.RuntimeStateError, _state_error_response)
 
     def require_auth(authorization: Annotated[str | None, Header()] = None) -> None:
         expected = token_reader()
@@ -223,6 +243,11 @@ def create_app(
     @app.post("/v1/turns/resume", dependencies=[Depends(require_auth)])
     def resume_turn(body: ResumeTurnInput) -> dict[str, object]:
         return _response(current_runtime().resume(body.runtime_context(), body.results))
+
+    @app.post("/v1/threads/delete", dependencies=[Depends(require_auth)])
+    def delete_thread(body: DeleteThreadInput) -> dict[str, str]:
+        current_runtime().delete_thread(body.thread_id)
+        return {"status": "deleted"}
 
     return app
 

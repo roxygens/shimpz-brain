@@ -48,6 +48,10 @@ class ProviderRequestError(RuntimeError):
     """A provider call failed without exposing provider response or credential material."""
 
 
+class RuntimeStateError(RuntimeError):
+    """A checkpoint operation failed without exposing persisted conversation data."""
+
+
 def normalize_team_name(value: str) -> str:
     """Return bounded display data while rejecting control-character injection."""
     if not isinstance(value, str) or TEAM_NAME_CONTROL_RE.search(value):
@@ -153,6 +157,8 @@ class TurnResult:
 
 class Checkpointer(Protocol):
     """The LangGraph checkpointer surface accepted by ``create_agent``."""
+
+    def delete_thread(self, thread_id: str) -> None: ...
 
 
 ModelFactory = Callable[[ProviderConfig], BaseChatModel]
@@ -304,6 +310,15 @@ class AgentRuntime:
         close = getattr(connection, "close", None)
         if callable(close):
             close()
+
+    def delete_thread(self, thread_id: str) -> None:
+        """Permanently remove one conversation without revealing whether it existed."""
+        if not isinstance(thread_id, str) or IDENTIFIER_RE.fullmatch(thread_id) is None:
+            raise RuntimeContractError("invalid conversation thread")
+        try:
+            self._checkpointer.delete_thread(thread_id)
+        except Exception as exc:
+            raise RuntimeStateError("checkpoint deletion failed") from exc
 
     @staticmethod
     def _config(context: TurnContext) -> dict[str, object]:

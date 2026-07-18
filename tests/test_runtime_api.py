@@ -76,6 +76,11 @@ class FakeRuntime:
             raise self.error
         return self.result
 
+    def delete_thread(self, thread_id):
+        self.calls.append(("delete_thread", thread_id))
+        if self.error:
+            raise self.error
+
 
 def client(runtime):
     app = runtime_api.create_app(runtime=runtime, token_reader=lambda: TOKEN)
@@ -169,6 +174,36 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertEqual(runtime.calls[0][0], "resume")
         self.assertEqual(runtime.calls[0][2], {"interrupt-1": {"message": "Hello, Ada."}})
 
+    def test_thread_deletion_is_authenticated_idempotent_and_closed(self):
+        runtime = FakeRuntime()
+        api = client(runtime)
+        payload = {"thread_id": "capsule:hello-pulse:conversation-1"}
+
+        self.assertEqual(api.post("/v1/threads/delete", json=payload).status_code, 401)
+        self.assertEqual(runtime.calls, [])
+
+        response = api.post(
+            "/v1/threads/delete",
+            json=payload,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "deleted"})
+        self.assertEqual(runtime.calls, [("delete_thread", payload["thread_id"])])
+
+        for invalid in (
+            {"thread_id": "bad thread"},
+            {"thread_id": payload["thread_id"], "unexpected": True},
+        ):
+            with self.subTest(invalid=invalid):
+                response = api.post(
+                    "/v1/threads/delete",
+                    json=invalid,
+                    headers={"Authorization": f"Bearer {TOKEN}"},
+                )
+                self.assertEqual(response.status_code, 422)
+        self.assertEqual(runtime.calls, [("delete_thread", payload["thread_id"])])
+
     def test_extra_fields_and_invalid_provider_fail_closed(self):
         api = client(FakeRuntime())
         invalid = body(unexpected_command="forbidden")
@@ -207,6 +242,18 @@ class RuntimeApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json(), {"detail": "Model provider request failed"})
+        self.assertNotIn(SECRET, response.text)
+
+    def test_state_error_is_generic_and_never_echoes_persisted_data(self):
+        runtime = FakeRuntime(error=agent_runtime.RuntimeStateError(f"failed to delete {SECRET}"))
+        response = client(runtime).post(
+            "/v1/threads/delete",
+            json={"thread_id": "capsule:hello-pulse:conversation-1"},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"detail": "Brain runtime state operation failed"})
         self.assertNotIn(SECRET, response.text)
 
     def test_sqlite_checkpoints_are_owner_only(self):
