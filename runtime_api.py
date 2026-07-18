@@ -9,13 +9,13 @@ import threading
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 import agent_runtime
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from langgraph.checkpoint.sqlite import SqliteSaver
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 TOKEN_FILE = Path(os.environ.get("SHIMPZ_BRAIN_RUNTIME_TOKEN_FILE", "/run/shimpz-brain-runtime/token"))
 STATE_PATH = Path(os.environ.get("SHIMPZ_BRAIN_RUNTIME_STATE", "/var/lib/shimpz-brain-runtime/checkpoints.sqlite3"))
@@ -39,28 +39,54 @@ class PowerInput(BaseModel):
     approval: Literal["none", "once", "each-run"] = "none"
 
 
+class AssistantInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128)
+    rules: str = Field(min_length=1, max_length=agent_runtime.MAX_RULES_CHARS)
+    powers: list[PowerInput] = Field(max_length=agent_runtime.MAX_POWERS)
+
+
 class TurnContextInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     thread_id: str = Field(min_length=1, max_length=256)
-    assistant_id: str = Field(min_length=1, max_length=128)
-    rules: str = Field(min_length=1, max_length=agent_runtime.MAX_RULES_CHARS)
-    powers: list[PowerInput] = Field(min_length=1, max_length=agent_runtime.MAX_POWERS)
+    team_name: str = Field(min_length=1, max_length=agent_runtime.MAX_TEAM_NAME_CHARS)
+    assistants: list[AssistantInput] = Field(min_length=1, max_length=agent_runtime.MAX_ASSISTANTS)
     provider: ProviderInput
+
+    @field_validator("team_name", mode="before")
+    @classmethod
+    def normalize_team_name(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        return agent_runtime.normalize_team_name(value)
+
+    @model_validator(mode="after")
+    def bound_total_powers(self) -> Self:
+        if sum(len(assistant.powers) for assistant in self.assistants) > agent_runtime.MAX_POWERS:
+            raise ValueError("a Team exposes too many Powers")
+        return self
 
     def runtime_context(self) -> agent_runtime.TurnContext:
         return agent_runtime.TurnContext(
             thread_id=self.thread_id,
-            assistant_id=self.assistant_id,
-            rules=self.rules,
-            powers=tuple(
-                agent_runtime.PowerDefinition(
-                    id=power.id,
-                    summary=power.summary,
-                    input_schema=power.input_schema,
-                    approval=power.approval,
+            team_name=self.team_name,
+            assistants=tuple(
+                agent_runtime.AssistantDefinition(
+                    id=assistant.id,
+                    rules=assistant.rules,
+                    powers=tuple(
+                        agent_runtime.PowerDefinition(
+                            id=power.id,
+                            summary=power.summary,
+                            input_schema=power.input_schema,
+                            approval=power.approval,
+                        )
+                        for power in assistant.powers
+                    ),
                 )
-                for power in self.powers
+                for assistant in self.assistants
             ),
             provider=agent_runtime.ProviderConfig(
                 provider=self.provider.provider,
@@ -128,6 +154,7 @@ def _response(result: agent_runtime.TurnResult) -> dict[str, object]:
         "powers": [
             {
                 "interrupt_id": request.interrupt_id,
+                "assistant_id": request.assistant_id,
                 "power": request.power,
                 "input": dict(request.input),
                 "approval": request.approval,

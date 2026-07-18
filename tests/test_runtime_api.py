@@ -16,19 +16,40 @@ SECRET = secrets.token_urlsafe(32)
 def body(**updates):
     value = {
         "thread_id": "capsule:hello-pulse:conversation-1",
-        "assistant_id": "hello-pulse",
-        "rules": "Return a friendly greeting.",
-        "powers": [
+        "team_name": "  Greeting Crew  ",
+        "assistants": [
             {
-                "id": "hello",
-                "summary": "Return a greeting.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"name": {"type": "string"}},
-                    "additionalProperties": False,
-                },
-                "approval": "none",
-            }
+                "id": "hello-pulse",
+                "rules": "Return a friendly greeting.",
+                "powers": [
+                    {
+                        "id": "hello",
+                        "summary": "Return a greeting.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"name": {"type": "string"}},
+                            "additionalProperties": False,
+                        },
+                        "approval": "none",
+                    }
+                ],
+            },
+            {
+                "id": "backup-greeter",
+                "rules": "Provide a backup greeting.",
+                "powers": [
+                    {
+                        "id": "hello",
+                        "summary": "Return a backup greeting.",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"name": {"type": "string"}},
+                            "additionalProperties": False,
+                        },
+                        "approval": "once",
+                    }
+                ],
+            },
         ],
         "provider": {"provider": "openai", "model": "gpt-test", "api_key": SECRET},
         "message": "Hello",
@@ -87,7 +108,11 @@ class RuntimeApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "completed", "reply": "Hello.", "powers": []})
-        self.assertEqual(runtime.calls[0][1].provider.api_key, SECRET)
+        context = runtime.calls[0][1]
+        self.assertEqual(context.provider.api_key, SECRET)
+        self.assertEqual(context.team_name, "Greeting Crew")
+        self.assertEqual([assistant.id for assistant in context.assistants], ["hello-pulse", "backup-greeter"])
+        self.assertEqual([assistant.powers[0].id for assistant in context.assistants], ["hello", "hello"])
         self.assertNotIn(SECRET, response.text)
 
     def test_power_request_contains_only_controller_action_data(self):
@@ -97,6 +122,7 @@ class RuntimeApiTests(unittest.TestCase):
                 powers=(
                     agent_runtime.PowerRequest(
                         interrupt_id="interrupt-1",
+                        assistant_id="hello-pulse",
                         power="hello",
                         input={"name": "Ada"},
                         approval="each-run",
@@ -119,6 +145,7 @@ class RuntimeApiTests(unittest.TestCase):
                 "powers": [
                     {
                         "interrupt_id": "interrupt-1",
+                        "assistant_id": "hello-pulse",
                         "power": "hello",
                         "input": {"name": "Ada"},
                         "approval": "each-run",
@@ -152,6 +179,23 @@ class RuntimeApiTests(unittest.TestCase):
         invalid["provider"]["provider"] = "codex"
         response = api.post("/v1/turns", json=invalid, headers={"Authorization": f"Bearer {TOKEN}"})
         self.assertEqual(response.status_code, 422)
+
+        invalid = body()
+        invalid["assistants"][0]["unexpected"] = "forbidden"
+        response = api.post("/v1/turns", json=invalid, headers={"Authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(response.status_code, 422)
+
+    def test_malformed_team_names_fail_at_the_closed_http_contract(self):
+        api = client(FakeRuntime())
+
+        for team_name in ("", "   ", "Bad\nName", "Bad\x7fName", "x" * 81):
+            with self.subTest(team_name=team_name):
+                response = api.post(
+                    "/v1/turns",
+                    json=body(team_name=team_name),
+                    headers={"Authorization": f"Bearer {TOKEN}"},
+                )
+                self.assertEqual(response.status_code, 422)
 
     def test_provider_error_is_generic_and_never_echoes_credential(self):
         runtime = FakeRuntime(error=agent_runtime.ProviderRequestError(f"provider rejected {SECRET}"))
