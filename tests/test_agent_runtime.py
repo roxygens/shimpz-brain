@@ -321,9 +321,7 @@ class AgentRuntimeTests(unittest.TestCase):
             assistants=(assistant("campaign-reader"),),
             provider=first.provider,
         )
-        model = BlockingScopeModel(
-            responses=[AIMessage(content="First reply."), AIMessage(content="Second reply.")]
-        )
+        model = BlockingScopeModel(responses=[AIMessage(content="First reply."), AIMessage(content="Second reply.")])
         runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)
 
         with ThreadPoolExecutor(max_workers=2) as executor:

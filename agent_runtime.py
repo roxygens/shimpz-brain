@@ -497,7 +497,7 @@ class AgentRuntime:
                     {"messages": [HumanMessage(content=message, id=turn_id)]},
                     config=self._config(context),
                 )
-        except (RuntimeContractError, RuntimeStateError):
+        except RuntimeContractError, RuntimeStateError:
             raise
         except Exception as exc:
             raise ProviderRequestError("model provider request failed") from exc
@@ -513,7 +513,7 @@ class AgentRuntime:
                     Command(resume=dict(results)),
                     config=self._config(context),
                 )
-        except (RuntimeContractError, RuntimeStateError):
+        except RuntimeContractError, RuntimeStateError:
             raise
         except Exception as exc:
             raise ProviderRequestError("model provider request failed") from exc
