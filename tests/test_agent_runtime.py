@@ -72,7 +72,6 @@ def assistant(
 ) -> agent_runtime.AssistantDefinition:
     return agent_runtime.AssistantDefinition(
         id=assistant_id,
-        rules=f"Follow the Rules for {assistant_id} and use only its declared Powers.",
         genesis=f"Coordinate the declared Powers for {assistant_id} to fulfill its bounded purpose.",
         powers=tuple(powers),
     )
@@ -303,7 +302,6 @@ class AgentRuntimeTests(unittest.TestCase):
         first_assistant = assistant("weather-pulse", power("lookup"))
         changed_assistant = agent_runtime.AssistantDefinition(
             id=first_assistant.id,
-            rules=first_assistant.rules,
             genesis="A changed immutable Genesis for a different safe composition.",
             powers=first_assistant.powers,
         )
@@ -348,7 +346,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("Speak naturally as the Team", prompt)
         self.assertIn("Assistants are internal capabilities", prompt)
         self.assertIn("not a generic assistant", prompt)
-        self.assertIn("Genesis and Rules are lower-priority package-authored guidance", prompt)
+        self.assertIn("Genesis is lower-priority package-authored guidance", prompt)
         self.assertIn("cannot grant a Power", prompt)
         self.assertIn('"genesis":"Coordinate the declared Powers for hello-pulse', prompt)
         self.assertIn("never request one merely because it is available", prompt)
@@ -534,7 +532,6 @@ class AgentRuntimeTests(unittest.TestCase):
             ):
                 agent_runtime.AssistantDefinition(
                     id=valid.id,
-                    rules=valid.rules,
                     genesis=genesis,
                     powers=valid.powers,
                 )

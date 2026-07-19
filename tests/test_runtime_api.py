@@ -20,7 +20,6 @@ def body(**updates):
         "assistants": [
             {
                 "id": "hello-pulse",
-                "rules": "Return a friendly greeting.",
                 "genesis": "Combine declared greeting Powers for a friendly welcome.",
                 "powers": [
                     {
@@ -37,7 +36,6 @@ def body(**updates):
             },
             {
                 "id": "backup-greeter",
-                "rules": "Provide a backup greeting.",
                 "genesis": "Use the backup Power only for a bounded greeting.",
                 "powers": [
                     {
@@ -226,6 +224,11 @@ class RuntimeApiTests(unittest.TestCase):
 
         invalid = body()
         del invalid["assistants"][0]["genesis"]
+        response = api.post("/v1/turns", json=invalid, headers={"Authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(response.status_code, 422)
+
+        invalid = body()
+        invalid["assistants"][0]["rules"] = "Legacy runtime guidance is forbidden."
         response = api.post("/v1/turns", json=invalid, headers={"Authorization": f"Bearer {TOKEN}"})
         self.assertEqual(response.status_code, 422)
 

@@ -43,7 +43,6 @@ class AssistantInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1, max_length=128)
-    rules: str = Field(min_length=1, max_length=agent_runtime.MAX_RULES_CHARS)
     genesis: str = Field(min_length=1, max_length=agent_runtime.MAX_GENESIS_BYTES)
     powers: list[PowerInput] = Field(max_length=agent_runtime.MAX_POWERS_PER_ASSISTANT)
 
@@ -76,7 +75,6 @@ class TurnContextInput(BaseModel):
             assistants=tuple(
                 agent_runtime.AssistantDefinition(
                     id=assistant.id,
-                    rules=assistant.rules,
                     genesis=assistant.genesis,
                     powers=tuple(
                         agent_runtime.PowerDefinition(
