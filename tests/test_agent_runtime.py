@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import threading
 import unittest
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 from unittest import mock
@@ -21,6 +23,30 @@ class ToolAwareFakeModel(FakeMessagesListChatModel):
     def bind_tools(self, tools: Sequence[Any], **_kwargs: Any):
         type(self).bound_tools = [tool.name for tool in tools]
         return self
+
+
+class RecordingToolAwareFakeModel(ToolAwareFakeModel):
+    seen_messages: ClassVar[list[list[Any]]] = []
+
+    def _generate(self, messages: list[Any], *args: Any, **kwargs: Any):
+        type(self).seen_messages.append(list(messages))
+        return super()._generate(messages, *args, **kwargs)
+
+
+class BlockingScopeModel(RecordingToolAwareFakeModel):
+    first_entered: ClassVar[threading.Event] = threading.Event()
+    release_first: ClassVar[threading.Event] = threading.Event()
+    second_entered: ClassVar[threading.Event] = threading.Event()
+
+    def _generate(self, messages: list[Any], *args: Any, **kwargs: Any):
+        current_message = str(messages[-1].content)
+        if current_message == "First concurrent scope":
+            type(self).first_entered.set()
+            if not type(self).release_first.wait(timeout=2):
+                raise RuntimeError("test did not release the first provider call")
+        elif current_message == "Second concurrent scope":
+            type(self).second_entered.set()
+        return super()._generate(messages, *args, **kwargs)
 
 
 def power(
@@ -71,6 +97,11 @@ def context(
 class AgentRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         ToolAwareFakeModel.bound_tools = []
+        RecordingToolAwareFakeModel.seen_messages = []
+        BlockingScopeModel.seen_messages = []
+        BlockingScopeModel.first_entered = threading.Event()
+        BlockingScopeModel.release_first = threading.Event()
+        BlockingScopeModel.second_entered = threading.Event()
 
     def test_returns_a_direct_reply_without_executing_any_power(self):
         model = ToolAwareFakeModel(responses=[AIMessage(content="Hello, Captain.")])
@@ -163,6 +194,134 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(first.reply, "The prior valid reply.")
         with self.assertRaisesRegex(agent_runtime.RuntimeContractError, "without an Assistant reply"):
             runtime.start(turn, "Try an undeclared tool")
+
+    def test_selected_to_empty_scope_never_leaks_prior_power_context(self):
+        for saver_kind in ("memory", "sqlite"):
+            with self.subTest(saver=saver_kind), tempfile.TemporaryDirectory() as directory:
+                if saver_kind == "memory":
+                    saver = InMemorySaver()
+                    connection = None
+                else:
+                    connection = sqlite3.connect(Path(directory) / "scope.sqlite3", check_same_thread=False)
+                    saver = SqliteSaver(connection)
+                    saver.setup()
+                selected = context(
+                    assistant("weather-pulse", power("lookup")),
+                    thread_id=f"team:scope:{saver_kind}",
+                )
+                selected_tool = agent_runtime._tool_name("weather-pulse", "lookup")
+                model = RecordingToolAwareFakeModel(
+                    responses=[
+                        AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": selected_tool,
+                                    "args": {"name": "Lisbon"},
+                                    "id": "provider-call-private",
+                                    "type": "tool_call",
+                                }
+                            ],
+                        ),
+                        AIMessage(content="The private Power result was used."),
+                        AIMessage(content="Brain-only reply."),
+                    ]
+                )
+                runtime = agent_runtime.AgentRuntime(
+                    saver,
+                    model_factory=lambda _config, selected_model=model: selected_model,
+                )
+
+                suspended = runtime.start(selected, "Use the private Power")
+                runtime.resume(selected, {suspended.powers[0].interrupt_id: {"secret": "PRIVATE"}})
+                empty = agent_runtime.TurnContext(
+                    thread_id=selected.thread_id,
+                    team_name=selected.team_name,
+                    assistants=(),
+                    provider=selected.provider,
+                )
+
+                result = runtime.start(empty, "Continue without Assistants")
+
+                self.assertEqual(result.reply, "Brain-only reply.")
+                provider_context = "\n".join(
+                    str(message.content) for message in RecordingToolAwareFakeModel.seen_messages[-1]
+                )
+                self.assertNotIn("PRIVATE", provider_context)
+                self.assertNotIn("private Power result", provider_context)
+                self.assertNotIn("Use the private Power", provider_context)
+                checkpoint = saver.get(runtime._config(empty))
+                self.assertIsNotNone(checkpoint)
+                self.assertEqual(len(checkpoint["channel_values"]["messages"]), 2)
+                runtime.delete_thread(empty.thread_id)
+                self.assertIsNone(saver.get(runtime._config(empty)))
+                if connection is not None:
+                    runtime.close()
+
+    def test_switching_selected_assistants_clears_the_prior_provider_context(self):
+        first = context(assistant("weather-pulse"), thread_id="team:scope:selected")
+        second = agent_runtime.TurnContext(
+            thread_id=first.thread_id,
+            team_name=first.team_name,
+            assistants=(assistant("campaign-reader"),),
+            provider=first.provider,
+        )
+        model = RecordingToolAwareFakeModel(
+            responses=[AIMessage(content="Weather-private reply."), AIMessage(content="Campaign reply.")]
+        )
+        runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)
+
+        runtime.start(first, "Weather-private question")
+        result = runtime.start(second, "Campaign question")
+
+        self.assertEqual(result.reply, "Campaign reply.")
+        provider_context = "\n".join(str(message.content) for message in model.seen_messages[-1])
+        self.assertNotIn("Weather-private", provider_context)
+        self.assertNotIn("weather-pulse", provider_context)
+        self.assertIn("campaign-reader", provider_context)
+
+    def test_same_exact_assistant_scope_preserves_conversation_context(self):
+        model = RecordingToolAwareFakeModel(
+            responses=[AIMessage(content="First scoped reply."), AIMessage(content="Second scoped reply.")]
+        )
+        runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)
+        turn = context(thread_id="team:scope:stable")
+
+        runtime.start(turn, "First scoped question")
+        result = runtime.start(turn, "Second scoped question")
+
+        self.assertEqual(result.reply, "Second scoped reply.")
+        provider_context = "\n".join(str(message.content) for message in model.seen_messages[-1])
+        self.assertIn("First scoped question", provider_context)
+        self.assertIn("First scoped reply", provider_context)
+
+    def test_concurrent_scope_changes_are_serialized_before_provider_context_is_built(self):
+        first = context(assistant("weather-pulse"), thread_id="team:scope:concurrent")
+        second = agent_runtime.TurnContext(
+            thread_id=first.thread_id,
+            team_name=first.team_name,
+            assistants=(assistant("campaign-reader"),),
+            provider=first.provider,
+        )
+        model = BlockingScopeModel(
+            responses=[AIMessage(content="First reply."), AIMessage(content="Second reply.")]
+        )
+        runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_result = executor.submit(runtime.start, first, "First concurrent scope")
+            self.assertTrue(model.first_entered.wait(timeout=1))
+            second_result = executor.submit(runtime.start, second, "Second concurrent scope")
+            second_was_blocked = not model.second_entered.wait(timeout=0.1)
+            model.release_first.set()
+            self.assertEqual(first_result.result(timeout=2).reply, "First reply.")
+            self.assertEqual(second_result.result(timeout=2).reply, "Second reply.")
+
+        self.assertTrue(second_was_blocked)
+        second_provider_context = "\n".join(str(message.content) for message in model.seen_messages[-1])
+        self.assertNotIn("First concurrent scope", second_provider_context)
+        self.assertNotIn("weather-pulse", second_provider_context)
+        self.assertIn("campaign-reader", second_provider_context)
 
     def test_system_prompt_uses_quoted_team_identity_and_internal_assistants(self):
         turn = context(team_name='  North "Star"  ')

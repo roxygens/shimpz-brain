@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import secrets
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -50,6 +51,8 @@ MAX_MESSAGE_CHARS = 64 * 1024
 MAX_SCHEMA_BYTES = 64 * 1024
 MAX_REPLY_CHARS = 64 * 1024
 DEFAULT_RECURSION_LIMIT = 12
+ASSISTANT_SCOPE_METADATA = "shimpz_assistant_scope"
+THREAD_LOCK_STRIPES = 64
 
 
 class RuntimeContractError(ValueError):
@@ -172,6 +175,8 @@ class Checkpointer(Protocol):
 
     def get(self, config: Mapping[str, Any]) -> Mapping[str, Any] | None: ...
 
+    def get_tuple(self, config: Mapping[str, Any]) -> object | None: ...
+
     def delete_thread(self, thread_id: str) -> None: ...
 
 
@@ -200,6 +205,28 @@ def _tool_name(assistant_id: str, power_id: str) -> str:
     power_slug = power_id.replace(".", "_")[:18]
     digest = hashlib.sha256(f"{assistant_id}\0{power_id}".encode()).hexdigest()[:16]
     return f"a_{assistant_slug}__p_{power_slug}__{digest}"
+
+
+def _assistant_scope(context: TurnContext) -> str:
+    """Bind durable conversation state to the exact available Assistant contract."""
+    contract = [
+        {
+            "id": assistant.id,
+            "rules": assistant.rules,
+            "powers": [
+                {
+                    "id": power.id,
+                    "summary": power.summary,
+                    "input_schema": power.input_schema,
+                    "approval": power.approval,
+                }
+                for power in sorted(assistant.powers, key=lambda item: item.id)
+            ],
+        }
+        for assistant in sorted(context.assistants, key=lambda item: item.id)
+    ]
+    encoded = json.dumps(contract, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _request_power(assistant_id: str, power: PowerDefinition) -> StructuredTool:
@@ -344,6 +371,11 @@ class AgentRuntime:
     def __init__(self, checkpointer: Checkpointer, *, model_factory: ModelFactory = provider_model) -> None:
         self._checkpointer = checkpointer
         self._model_factory = model_factory
+        self._thread_locks = tuple(threading.RLock() for _ in range(THREAD_LOCK_STRIPES))
+
+    def _thread_lock(self, thread_id: str) -> threading.RLock:
+        digest = hashlib.sha256(thread_id.encode()).digest()
+        return self._thread_locks[int.from_bytes(digest[:2]) % len(self._thread_locks)]
 
     def close(self) -> None:
         """Close a durable checkpointer connection when this runtime owns one."""
@@ -357,7 +389,8 @@ class AgentRuntime:
         if not isinstance(thread_id, str) or IDENTIFIER_RE.fullmatch(thread_id) is None:
             raise RuntimeContractError("invalid conversation thread")
         try:
-            self._checkpointer.delete_thread(thread_id)
+            with self._thread_lock(thread_id):
+                self._checkpointer.delete_thread(thread_id)
         except Exception as exc:
             raise RuntimeStateError("checkpoint deletion failed") from exc
 
@@ -365,6 +398,7 @@ class AgentRuntime:
     def _config(context: TurnContext) -> dict[str, object]:
         return {
             "configurable": {"thread_id": context.thread_id},
+            "metadata": {ASSISTANT_SCOPE_METADATA: _assistant_scope(context)},
             "recursion_limit": DEFAULT_RECURSION_LIMIT,
         }
 
@@ -380,13 +414,26 @@ class AgentRuntime:
             checkpointer=self._checkpointer,
         )
 
-    def _checkpoint_message_count(self, context: TurnContext) -> int:
+    def _prepare_scope(self, context: TurnContext, *, resume: bool) -> int:
+        """Retain history only while the exact Assistant contract remains selected."""
         try:
-            checkpoint = self._checkpointer.get(self._config(context))
+            checkpoint_tuple = self._checkpointer.get_tuple(self._config(context))
         except Exception as exc:
             raise RuntimeStateError("checkpoint read failed") from exc
-        if checkpoint is None:
+        if checkpoint_tuple is None:
+            if resume:
+                raise RuntimeContractError("conversation has no pending Power request")
             return 0
+        metadata = getattr(checkpoint_tuple, "metadata", None)
+        expected_scope = _assistant_scope(context)
+        if not isinstance(metadata, Mapping) or metadata.get(ASSISTANT_SCOPE_METADATA) != expected_scope:
+            self.delete_thread(context.thread_id)
+            if resume:
+                raise RuntimeContractError("Assistant scope changed during the pending turn")
+            return 0
+        checkpoint = getattr(checkpoint_tuple, "checkpoint", None)
+        if not isinstance(checkpoint, Mapping):
+            raise RuntimeStateError("checkpoint state is invalid")
         channel_values = checkpoint.get("channel_values")
         if not isinstance(channel_values, Mapping):
             raise RuntimeStateError("checkpoint state is invalid")
@@ -400,11 +447,13 @@ class AgentRuntime:
             raise RuntimeContractError("invalid chat message")
         turn_id = f"shimpz-turn-{secrets.token_hex(16)}"
         try:
-            state = self._agent(context).invoke(
-                {"messages": [HumanMessage(content=message, id=turn_id)]},
-                config=self._config(context),
-            )
-        except RuntimeContractError:
+            with self._thread_lock(context.thread_id):
+                self._prepare_scope(context, resume=False)
+                state = self._agent(context).invoke(
+                    {"messages": [HumanMessage(content=message, id=turn_id)]},
+                    config=self._config(context),
+                )
+        except (RuntimeContractError, RuntimeStateError):
             raise
         except Exception as exc:
             raise ProviderRequestError("model provider request failed") from exc
@@ -413,13 +462,14 @@ class AgentRuntime:
     def resume(self, context: TurnContext, results: Mapping[str, object]) -> TurnResult:
         if not results or not all(isinstance(key, str) and key for key in results):
             raise RuntimeContractError("invalid Power resume results")
-        message_offset = self._checkpoint_message_count(context)
         try:
-            state = self._agent(context).invoke(
-                Command(resume=dict(results)),
-                config=self._config(context),
-            )
-        except RuntimeContractError:
+            with self._thread_lock(context.thread_id):
+                message_offset = self._prepare_scope(context, resume=True)
+                state = self._agent(context).invoke(
+                    Command(resume=dict(results)),
+                    config=self._config(context),
+                )
+        except (RuntimeContractError, RuntimeStateError):
             raise
         except Exception as exc:
             raise ProviderRequestError("model provider request failed") from exc
