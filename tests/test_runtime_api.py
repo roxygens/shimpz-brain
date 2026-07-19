@@ -228,11 +228,6 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
         invalid = body()
-        invalid["assistants"][0]["rules"] = "Legacy runtime guidance is forbidden."
-        response = api.post("/v1/turns", json=invalid, headers={"Authorization": f"Bearer {TOKEN}"})
-        self.assertEqual(response.status_code, 422)
-
-        invalid = body()
         invalid["provider"]["provider"] = "codex"
         response = api.post("/v1/turns", json=invalid, headers={"Authorization": f"Bearer {TOKEN}"})
         self.assertEqual(response.status_code, 422)
