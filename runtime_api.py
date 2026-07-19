@@ -52,7 +52,7 @@ class TurnContextInput(BaseModel):
 
     thread_id: str = Field(min_length=1, max_length=256)
     team_name: str = Field(min_length=1, max_length=agent_runtime.MAX_TEAM_NAME_CHARS)
-    assistants: list[AssistantInput] = Field(min_length=1, max_length=agent_runtime.MAX_ASSISTANTS)
+    assistants: list[AssistantInput] = Field(max_length=agent_runtime.MAX_ASSISTANTS)
     provider: ProviderInput
 
     @field_validator("team_name", mode="before")

@@ -82,6 +82,61 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.reply, "Hello, Captain.")
         self.assertEqual(result.powers, ())
 
+    def test_empty_assistant_context_binds_no_tools_and_returns_a_natural_reply(self):
+        model = ToolAwareFakeModel(responses=[AIMessage(content="I can help you think this through.")])
+        runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)
+        turn = agent_runtime.TurnContext(
+            thread_id="team:brain-only:thread-1",
+            team_name="Planning",
+            assistants=(),
+            provider=agent_runtime.ProviderConfig(
+                provider="openai",
+                model="gpt-5.6-terra",
+                api_key="secret-test-key",
+            ),
+        )
+
+        result = runtime.start(turn, "Help me organize an idea")
+
+        self.assertEqual(ToolAwareFakeModel.bound_tools, [])
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.reply, "I can help you think this through.")
+        self.assertEqual(result.powers, ())
+        self.assertIn("This turn has no Assistant Powers or external action tools.", agent_runtime._system_prompt(turn))
+
+    def test_empty_assistant_context_rejects_an_undeclared_tool_call(self):
+        model = ToolAwareFakeModel(
+            responses=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "undeclared_tool",
+                            "args": {},
+                            "id": "provider-call-1",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+        runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)
+        turn = agent_runtime.TurnContext(
+            thread_id="team:brain-only:thread-2",
+            team_name="Planning",
+            assistants=(),
+            provider=agent_runtime.ProviderConfig(
+                provider="openai",
+                model="gpt-5.6-terra",
+                api_key="secret-test-key",
+            ),
+        )
+
+        with self.assertRaisesRegex(agent_runtime.RuntimeContractError, "without an Assistant reply"):
+            runtime.start(turn, "Run an undeclared tool")
+
+        self.assertEqual(ToolAwareFakeModel.bound_tools, [])
+
     def test_system_prompt_uses_quoted_team_identity_and_internal_assistants(self):
         turn = context(team_name='  North "Star"  ')
         prompt = agent_runtime._system_prompt(turn)
@@ -292,7 +347,7 @@ class AgentRuntimeTests(unittest.TestCase):
             ):
                 context(team_name=invalid_name)
 
-        with self.assertRaisesRegex(agent_runtime.RuntimeContractError, "1 to 16 Assistants"):
+        with self.assertRaisesRegex(agent_runtime.RuntimeContractError, "at most 16 Assistants"):
             context(*(assistant(f"helper-{index}") for index in range(agent_runtime.MAX_ASSISTANTS + 1)))
         with self.assertRaisesRegex(agent_runtime.RuntimeContractError, "duplicate Assistant id"):
             context(assistant("same-helper"), assistant("same-helper"))

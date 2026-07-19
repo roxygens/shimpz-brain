@@ -120,6 +120,18 @@ class RuntimeApiTests(unittest.TestCase):
         self.assertEqual([assistant.powers[0].id for assistant in context.assistants], ["hello", "hello"])
         self.assertNotIn(SECRET, response.text)
 
+    def test_start_accepts_an_explicit_brain_only_context(self):
+        runtime = FakeRuntime(result=agent_runtime.TurnResult(status="completed", reply="Brain only."))
+        response = client(runtime).post(
+            "/v1/turns",
+            json=body(assistants=[]),
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "completed", "reply": "Brain only.", "powers": []})
+        self.assertEqual(runtime.calls[0][1].assistants, ())
+
     def test_power_request_contains_only_controller_action_data(self):
         runtime = FakeRuntime(
             result=agent_runtime.TurnResult(

@@ -141,8 +141,8 @@ class TurnContext:
         if IDENTIFIER_RE.fullmatch(self.thread_id) is None:
             raise RuntimeContractError("invalid conversation thread")
         object.__setattr__(self, "team_name", normalize_team_name(self.team_name))
-        if not 1 <= len(self.assistants) <= MAX_ASSISTANTS:
-            raise RuntimeContractError("a Team must contain 1 to 16 Assistants")
+        if len(self.assistants) > MAX_ASSISTANTS:
+            raise RuntimeContractError("a Team may contain at most 16 Assistants")
         assistant_ids = [assistant.id for assistant in self.assistants]
         if len(assistant_ids) != len(set(assistant_ids)):
             raise RuntimeContractError("duplicate Assistant id")
@@ -231,6 +231,8 @@ def _system_prompt(context: TurnContext) -> str:
         )
         for assistant in context.assistants
     )
+    if not assistants:
+        assistants = "None. This turn has no Assistant Powers or external action tools."
     return (
         "You are the Brain for exactly one installed Shimpz Team. "
         "Speak naturally to the user as that Team, never as one of its internal Assistants. "
