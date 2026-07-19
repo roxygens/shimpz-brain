@@ -21,6 +21,7 @@ def body(**updates):
             {
                 "id": "hello-pulse",
                 "rules": "Return a friendly greeting.",
+                "genesis": "Combine declared greeting Powers for a friendly welcome.",
                 "powers": [
                     {
                         "id": "hello",
@@ -37,6 +38,7 @@ def body(**updates):
             {
                 "id": "backup-greeter",
                 "rules": "Provide a backup greeting.",
+                "genesis": "Use the backup Power only for a bounded greeting.",
                 "powers": [
                     {
                         "id": "hello",
@@ -116,7 +118,7 @@ class RuntimeApiTests(unittest.TestCase):
         context = runtime.calls[0][1]
         self.assertEqual(context.provider.api_key, SECRET)
         self.assertEqual(context.team_name, "Greeting Crew")
-        self.assertEqual([assistant.id for assistant in context.assistants], ["hello-pulse", "backup-greeter"])
+        self.assertEqual([assistant.id for assistant in context.assistants], ["backup-greeter", "hello-pulse"])
         self.assertEqual([assistant.powers[0].id for assistant in context.assistants], ["hello", "hello"])
         self.assertNotIn(SECRET, response.text)
 
@@ -219,6 +221,11 @@ class RuntimeApiTests(unittest.TestCase):
     def test_extra_fields_and_invalid_provider_fail_closed(self):
         api = client(FakeRuntime())
         invalid = body(unexpected_command="forbidden")
+        response = api.post("/v1/turns", json=invalid, headers={"Authorization": f"Bearer {TOKEN}"})
+        self.assertEqual(response.status_code, 422)
+
+        invalid = body()
+        del invalid["assistants"][0]["genesis"]
         response = api.post("/v1/turns", json=invalid, headers={"Authorization": f"Bearer {TOKEN}"})
         self.assertEqual(response.status_code, 422)
 
