@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
@@ -18,7 +19,7 @@ from typing import Any, Literal, Protocol
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 from langgraph.types import Command, interrupt
@@ -169,6 +170,8 @@ class TurnResult:
 class Checkpointer(Protocol):
     """The LangGraph checkpointer surface accepted by ``create_agent``."""
 
+    def get(self, config: Mapping[str, Any]) -> Mapping[str, Any] | None: ...
+
     def delete_thread(self, thread_id: str) -> None: ...
 
 
@@ -265,7 +268,12 @@ def _message_content(value: object) -> str:
     return "\n".join(text)
 
 
-def _result(state: Mapping[str, Any]) -> TurnResult:
+def _result(
+    state: Mapping[str, Any],
+    *,
+    after_message_id: str | None = None,
+    message_offset: int | None = None,
+) -> TurnResult:
     pending = state.get("__interrupt__")
     if pending:
         requests: list[PowerRequest] = []
@@ -301,11 +309,31 @@ def _result(state: Mapping[str, Any]) -> TurnResult:
     messages = state.get("messages")
     if not isinstance(messages, Sequence):
         raise RuntimeContractError("graph completed without messages")
-    for message in reversed(messages):
-        if isinstance(message, AIMessage) and not message.tool_calls:
-            reply = _message_content(message.content).strip()
-            if not reply:
-                continue
+
+    if (after_message_id is None) == (message_offset is None):
+        raise RuntimeContractError("graph result boundary is invalid")
+    if after_message_id is not None:
+        boundary = next(
+            (index for index, message in enumerate(messages) if getattr(message, "id", None) == after_message_id),
+            None,
+        )
+        if boundary is None:
+            raise RuntimeContractError("graph completed without the current turn")
+        current_messages = messages[boundary + 1 :]
+    else:
+        if message_offset is None:
+            raise RuntimeContractError("graph result boundary is invalid")
+        if message_offset < 0 or message_offset > len(messages):
+            raise RuntimeContractError("graph result boundary is invalid")
+        current_messages = messages[message_offset:]
+
+    reply_message = next(
+        (message for message in reversed(current_messages) if isinstance(message, AIMessage)),
+        None,
+    )
+    if reply_message is not None and not reply_message.tool_calls and not reply_message.invalid_tool_calls:
+        reply = _message_content(reply_message.content).strip()
+        if reply:
             return TurnResult(status="completed", reply=reply[:MAX_REPLY_CHARS])
     raise RuntimeContractError("graph completed without an Assistant reply")
 
@@ -352,23 +380,40 @@ class AgentRuntime:
             checkpointer=self._checkpointer,
         )
 
+    def _checkpoint_message_count(self, context: TurnContext) -> int:
+        try:
+            checkpoint = self._checkpointer.get(self._config(context))
+        except Exception as exc:
+            raise RuntimeStateError("checkpoint read failed") from exc
+        if checkpoint is None:
+            return 0
+        channel_values = checkpoint.get("channel_values")
+        if not isinstance(channel_values, Mapping):
+            raise RuntimeStateError("checkpoint state is invalid")
+        messages = channel_values.get("messages", ())
+        if not isinstance(messages, Sequence):
+            raise RuntimeStateError("checkpoint state is invalid")
+        return len(messages)
+
     def start(self, context: TurnContext, message: str) -> TurnResult:
         if not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE_CHARS:
             raise RuntimeContractError("invalid chat message")
+        turn_id = f"shimpz-turn-{secrets.token_hex(16)}"
         try:
             state = self._agent(context).invoke(
-                {"messages": [{"role": "user", "content": message}]},
+                {"messages": [HumanMessage(content=message, id=turn_id)]},
                 config=self._config(context),
             )
         except RuntimeContractError:
             raise
         except Exception as exc:
             raise ProviderRequestError("model provider request failed") from exc
-        return _result(state)
+        return _result(state, after_message_id=turn_id)
 
     def resume(self, context: TurnContext, results: Mapping[str, object]) -> TurnResult:
         if not results or not all(isinstance(key, str) and key for key in results):
             raise RuntimeContractError("invalid Power resume results")
+        message_offset = self._checkpoint_message_count(context)
         try:
             state = self._agent(context).invoke(
                 Command(resume=dict(results)),
@@ -378,4 +423,4 @@ class AgentRuntime:
             raise
         except Exception as exc:
             raise ProviderRequestError("model provider request failed") from exc
-        return _result(state)
+        return _result(state, message_offset=message_offset)

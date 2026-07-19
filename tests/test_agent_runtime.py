@@ -137,6 +137,33 @@ class AgentRuntimeTests(unittest.TestCase):
 
         self.assertEqual(ToolAwareFakeModel.bound_tools, [])
 
+    def test_same_thread_never_reuses_a_prior_reply_after_an_invalid_tool_call(self):
+        model = ToolAwareFakeModel(
+            responses=[
+                AIMessage(content="The prior valid reply."),
+                AIMessage(
+                    content="",
+                    invalid_tool_calls=[
+                        {
+                            "name": "undeclared_tool",
+                            "args": "{}",
+                            "id": "provider-call-invalid",
+                            "error": "undeclared",
+                            "type": "invalid_tool_call",
+                        }
+                    ],
+                ),
+            ]
+        )
+        runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)
+        turn = context(thread_id="team:one:shared-thread")
+
+        first = runtime.start(turn, "First message")
+
+        self.assertEqual(first.reply, "The prior valid reply.")
+        with self.assertRaisesRegex(agent_runtime.RuntimeContractError, "without an Assistant reply"):
+            runtime.start(turn, "Try an undeclared tool")
+
     def test_system_prompt_uses_quoted_team_identity_and_internal_assistants(self):
         turn = context(team_name='  North "Star"  ')
         prompt = agent_runtime._system_prompt(turn)
