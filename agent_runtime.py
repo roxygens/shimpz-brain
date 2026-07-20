@@ -462,6 +462,27 @@ class AgentRuntime:
             if resume:
                 raise RuntimeContractError("conversation has no pending Power request")
             return 0
+        pending_writes = getattr(checkpoint_tuple, "pending_writes", None)
+        if pending_writes is not None and (
+            not isinstance(pending_writes, Sequence) or isinstance(pending_writes, (str, bytes))
+        ):
+            raise RuntimeStateError("checkpoint pending state is invalid")
+        has_pending_interrupt = False
+        for write in pending_writes or ():
+            if (
+                not isinstance(write, tuple)
+                or len(write) != 3
+                or not isinstance(write[0], str)
+                or not isinstance(write[1], str)
+            ):
+                raise RuntimeStateError("checkpoint pending state is invalid")
+            if write[1] == "__interrupt__":
+                has_pending_interrupt = True
+        if resume and not has_pending_interrupt:
+            raise RuntimeContractError("conversation has no pending Power request")
+        if not resume and has_pending_interrupt:
+            self.delete_thread(context.thread_id)
+            return 0
         metadata = getattr(checkpoint_tuple, "metadata", None)
         expected_scope = _assistant_scope(context)
         if not isinstance(metadata, Mapping) or metadata.get(ASSISTANT_SCOPE_METADATA) != expected_scope:

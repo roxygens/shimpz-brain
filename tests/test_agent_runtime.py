@@ -298,6 +298,59 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("First scoped question", provider_context)
         self.assertIn("First scoped reply", provider_context)
 
+    def test_new_turn_discards_an_abandoned_power_interrupt(self):
+        for saver_kind in ("memory", "sqlite"):
+            with self.subTest(saver=saver_kind), tempfile.TemporaryDirectory() as directory:
+                if saver_kind == "memory":
+                    saver = InMemorySaver()
+                    connection = None
+                else:
+                    connection = sqlite3.connect(Path(directory) / "interrupt.sqlite3", check_same_thread=False)
+                    saver = SqliteSaver(connection)
+                    saver.setup()
+                selected_tool = agent_runtime._tool_name("weather-pulse", "lookup")
+                model = RecordingToolAwareFakeModel(
+                    responses=[
+                        AIMessage(
+                            content="",
+                            tool_calls=[
+                                {
+                                    "name": selected_tool,
+                                    "args": {"name": "Lisbon"},
+                                    "id": "provider-call-abandoned",
+                                    "type": "tool_call",
+                                }
+                            ],
+                        ),
+                        AIMessage(content="Fresh reply after cancellation."),
+                    ]
+                )
+                runtime = agent_runtime.AgentRuntime(
+                    saver,
+                    model_factory=lambda _config, selected_model=model: selected_model,
+                )
+                turn = context(
+                    assistant("weather-pulse", power("lookup")),
+                    thread_id=f"team:interrupt:{saver_kind}",
+                )
+
+                suspended = runtime.start(turn, "Use the Power and then wait")
+                result = runtime.start(turn, "Start a clean turn")
+
+                self.assertEqual(suspended.status, "power-required")
+                self.assertEqual(result.reply, "Fresh reply after cancellation.")
+                provider_context = "\n".join(
+                    str(message.content) for message in RecordingToolAwareFakeModel.seen_messages[-1]
+                )
+                self.assertNotIn("Use the Power and then wait", provider_context)
+                self.assertNotIn("provider-call-abandoned", provider_context)
+                self.assertIn("Start a clean turn", provider_context)
+                checkpoint = saver.get(runtime._config(turn))
+                self.assertIsNotNone(checkpoint)
+                self.assertEqual(len(checkpoint["channel_values"]["messages"]), 2)
+                if connection is not None:
+                    runtime.close()
+
     def test_genesis_is_part_of_the_exact_history_scope(self):
         first_assistant = assistant("weather-pulse", power("lookup"))
         changed_assistant = agent_runtime.AssistantDefinition(
