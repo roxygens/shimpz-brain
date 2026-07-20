@@ -17,4 +17,4 @@ Both POST endpoints require the private bearer token mounted at
 access logging and disables LangSmith tracing by default.
 
 ---
-Part of the **[Shimpz](https://github.com/roxygens/shimpz)** stack.
+Part of the **[Shimpz](https://github.com/TheShimpz/shimpz)** stack.
