@@ -4,9 +4,19 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+UV_IMAGE = "ghcr.io/astral-sh/uv:0.11.25@sha256:1e3808aa9023d0980e7c15b1fa7c1ac16ff35925780cf5c459858b2d693f01a9"
 
 
 class BrainImageContractTests(unittest.TestCase):
+    def test_builder_obtains_content_addressed_uv_without_apt(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+        self.assertIn(f"FROM {UV_IMAGE} AS uv", dockerfile)
+        self.assertIn("COPY --from=uv /uv /usr/local/bin/uv", dockerfile)
+        self.assertNotIn("uv-install.sh", dockerfile)
+        self.assertNotIn("apt-get", dockerfile)
+        self.assertNotIn("curl", dockerfile)
+
     def test_image_runs_only_the_non_root_http_runtime(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 

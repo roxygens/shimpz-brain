@@ -1,39 +1,13 @@
 # syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
 # check=skip=SecretsUsedInArgOrEnv ; SHIMPZ_BRAIN_RUNTIME_TOKEN_GID is a numeric group id, never a credential
 
-FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1 AS builder
+FROM ghcr.io/astral-sh/uv:0.11.25@sha256:1e3808aa9023d0980e7c15b1fa7c1ac16ff35925780cf5c459858b2d693f01a9 AS uv
 ARG SOURCE_DATE_EPOCH=0
 
-# uv is fetched from its immutable versioned endpoint and verified before execution.
-ARG UV_VERSION=0.11.25
-ARG UV_INSTALL_SHA256=ca2de1bca2913ba30ce88658b6d90a663c627ecac378803aa58084a9adb35a46
-ARG DEBIAN_SNAPSHOT=20260623T000000Z
-
-RUN set -eux; \
-    . /etc/os-release; \
-    archive_keyring="$(find /usr/share/keyrings -maxdepth 1 -type f -name 'debian-archive-keyring.*' -print -quit)"; \
-    test -n "$archive_keyring"; \
-    rm -f /etc/apt/sources.list; \
-    find /etc/apt/sources.list.d -maxdepth 1 -type f -delete; \
-    printf '%s\n' \
-        "deb [signed-by=${archive_keyring}] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} ${VERSION_CODENAME} main" \
-        "deb [signed-by=${archive_keyring}] https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT} ${VERSION_CODENAME}-updates main" \
-        "deb [signed-by=${archive_keyring}] https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} ${VERSION_CODENAME}-security main" \
-        > /etc/apt/sources.list.d/debian-snapshot.list; \
-    printf 'Acquire::Check-Valid-Until "false";\n' > /etc/apt/apt.conf.d/99shimpz-snapshot; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends curl ca-certificates; \
-    curl --proto '=https' --tlsv1.2 -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/uv-install.sh; \
-    echo "${UV_INSTALL_SHA256}  /tmp/uv-install.sh" | sha256sum -c -; \
-    env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh /tmp/uv-install.sh; \
-    rm -f /tmp/uv-install.sh; \
-    apt-get clean; \
-    rm -rf /var/lib/apt/lists/* /var/lib/apt/periodic/* /var/cache/apt/* /var/cache/fontconfig/* \
-        /var/cache/ldconfig/aux-cache /var/cache/man/* /var/log/apt/* /var/log/alternatives.log \
-        /var/log/dpkg.log; \
-    uv --version
-
+FROM python:3.14-slim@sha256:b877e50bd90de10af8d82c57a022fc2e0dc731c5320d762a27986facfc3355c1 AS builder
+ARG SOURCE_DATE_EPOCH=0
 WORKDIR /build
+COPY --from=uv /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 RUN export UV_PROJECT_ENVIRONMENT=/opt/venv UV_CACHE_DIR=/tmp/uv-cache UV_LINK_MODE=copy; \
     uv sync --frozen --no-install-project --no-dev --python 3.14 \
