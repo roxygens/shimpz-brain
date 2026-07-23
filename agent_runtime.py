@@ -15,6 +15,7 @@ import secrets
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from langchain.agents import create_agent
@@ -26,16 +27,10 @@ from langchain_openai import ChatOpenAI
 from langgraph.types import Command, interrupt
 from pydantic import SecretStr
 
+_MODEL_CATALOG = json.loads(Path(__file__).with_name("model_catalog.json").read_text(encoding="utf-8"))
 MODELS_BY_PROVIDER = {
-    "openai": frozenset({"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"}),
-    "anthropic": frozenset(
-        {
-            "claude-fable-5",
-            "claude-opus-4-8",
-            "claude-sonnet-5",
-            "claude-haiku-4-5-20251001",
-        }
-    ),
+    provider["id"]: frozenset(model["id"] for model in provider["models"])
+    for provider in _MODEL_CATALOG["providers"]
 }
 PROVIDERS = frozenset(MODELS_BY_PROVIDER)
 APPROVALS = frozenset({"none", "once", "each-run"})
@@ -79,7 +74,7 @@ def normalize_team_name(value: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ProviderConfig:
-    provider: Literal["anthropic", "openai"]
+    provider: str
     model: str
     api_key: str
 
