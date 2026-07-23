@@ -36,7 +36,6 @@ class PowerInput(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     summary: str = Field(min_length=1, max_length=2_000)
     input_schema: dict[str, Any]
-    approval: Literal["none", "once", "each-run"] = "none"
 
 
 class AssistantInput(BaseModel):
@@ -81,7 +80,6 @@ class TurnContextInput(BaseModel):
                             id=power.id,
                             summary=power.summary,
                             input_schema=power.input_schema,
-                            approval=power.approval,
                         )
                         for power in assistant.powers
                     ),
@@ -172,7 +170,6 @@ def _response(result: agent_runtime.TurnResult) -> dict[str, object]:
                 "assistant_id": request.assistant_id,
                 "power": request.power,
                 "input": dict(request.input),
-                "approval": request.approval,
             }
             for request in result.powers
         ],

@@ -2,7 +2,7 @@
 
 The runtime can reason, remember a conversation and request a declared Power.  A Power
 request always suspends the graph before any side effect.  The Team Controller remains
-the only component allowed to validate approvals, execute the Power and resume the graph
+the only component allowed to execute the Power and resume the graph
 with its bounded result.
 """
 
@@ -32,7 +32,6 @@ MODELS_BY_PROVIDER = {
     provider["id"]: frozenset(model["id"] for model in provider["models"]) for provider in _MODEL_CATALOG["providers"]
 }
 PROVIDERS = frozenset(MODELS_BY_PROVIDER)
-APPROVALS = frozenset({"none", "once", "each-run"})
 POWER_ID_RE = re.compile(r"[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\Z")
 IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}\Z")
 TEAM_NAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -91,15 +90,12 @@ class PowerDefinition:
     id: str
     summary: str
     input_schema: Mapping[str, Any]
-    approval: Literal["none", "once", "each-run"] = "none"
 
     def __post_init__(self) -> None:
         if POWER_ID_RE.fullmatch(self.id) is None:
             raise RuntimeContractError("invalid Power id")
         if not self.summary.strip() or len(self.summary) > 2_000:
             raise RuntimeContractError("invalid Power summary")
-        if self.approval not in APPROVALS:
-            raise RuntimeContractError("invalid Power approval policy")
         if self.input_schema.get("type") != "object":
             raise RuntimeContractError("Power input schema must describe an object")
         try:
@@ -165,7 +161,6 @@ class PowerRequest:
     assistant_id: str
     power: str
     input: Mapping[str, Any]
-    approval: Literal["none", "once", "each-run"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,7 +218,6 @@ def _assistant_scope(context: TurnContext) -> str:
                     "id": power.id,
                     "summary": power.summary,
                     "input_schema": power.input_schema,
-                    "approval": power.approval,
                 }
                 for power in sorted(assistant.powers, key=lambda item: item.id)
             ],
@@ -244,7 +238,6 @@ def _request_power(assistant_id: str, power: PowerDefinition) -> StructuredTool:
                 "assistant_id": assistant_id,
                 "power": power.id,
                 "input": payload,
-                "approval": power.approval,
             }
         )
 
@@ -264,7 +257,6 @@ def _system_prompt(context: TurnContext) -> str:
             "id": assistant.id,
             "powers": [
                 {
-                    "approval": power.approval,
                     "id": power.id,
                     "summary": power.summary,
                 }
@@ -349,7 +341,7 @@ def _result(
                 or POWER_ID_RE.fullmatch(str(value.get("assistant_id", ""))) is None
                 or POWER_ID_RE.fullmatch(str(value.get("power", ""))) is None
                 or not isinstance(value.get("input"), Mapping)
-                or value.get("approval") not in APPROVALS
+                or set(value) != {"kind", "assistant_id", "power", "input"}
             ):
                 raise RuntimeContractError("invalid Power suspension")
             requests.append(
@@ -358,7 +350,6 @@ def _result(
                     assistant_id=str(value["assistant_id"]),
                     power=str(value["power"]),
                     input=dict(value["input"]),
-                    approval=value["approval"],
                 )
             )
         if not requests:

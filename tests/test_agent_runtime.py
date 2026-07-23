@@ -49,11 +49,7 @@ class BlockingScopeModel(RecordingToolAwareFakeModel):
         return super()._generate(messages, *args, **kwargs)
 
 
-def power(
-    power_id: str = "hello",
-    *,
-    approval: str = "none",
-) -> agent_runtime.PowerDefinition:
+def power(power_id: str = "hello") -> agent_runtime.PowerDefinition:
     return agent_runtime.PowerDefinition(
         id=power_id,
         summary=f"Run {power_id}.",
@@ -62,7 +58,6 @@ def power(
             "properties": {"name": {"type": "string", "maxLength": 80}},
             "additionalProperties": False,
         },
-        approval=approval,
     )
 
 
@@ -445,7 +440,7 @@ class AgentRuntimeTests(unittest.TestCase):
         runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)
         turn = context(
             assistant("place-scout", power("lookup")),
-            assistant("weather-pulse", power("lookup", approval="each-run")),
+            assistant("weather-pulse", power("lookup")),
         )
 
         suspended = runtime.start(turn, "Greet Ada")
@@ -464,7 +459,6 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(request.assistant_id, "weather-pulse")
         self.assertEqual(request.power, "lookup")
         self.assertEqual(request.input, {"name": "Ada"})
-        self.assertEqual(request.approval, "each-run")
 
         completed = runtime.resume(turn, {request.interrupt_id: {"message": "Hello, Ada."}})
 

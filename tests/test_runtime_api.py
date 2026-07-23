@@ -30,7 +30,6 @@ def body(**updates):
                             "properties": {"name": {"type": "string"}},
                             "additionalProperties": False,
                         },
-                        "approval": "none",
                     }
                 ],
             },
@@ -46,7 +45,6 @@ def body(**updates):
                             "properties": {"name": {"type": "string"}},
                             "additionalProperties": False,
                         },
-                        "approval": "once",
                     }
                 ],
             },
@@ -142,7 +140,6 @@ class RuntimeApiTests(unittest.TestCase):
                         assistant_id="hello-pulse",
                         power="hello",
                         input={"name": "Ada"},
-                        approval="each-run",
                     ),
                 ),
             )
@@ -165,7 +162,6 @@ class RuntimeApiTests(unittest.TestCase):
                         "assistant_id": "hello-pulse",
                         "power": "hello",
                         "input": {"name": "Ada"},
-                        "approval": "each-run",
                     }
                 ],
             },
