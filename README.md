@@ -1,20 +1,26 @@
-# shimpz-brain
+# Shimpz Brain runtime
 
-The isolated, provider-neutral Brain runtime for a Shimpz Team. It uses LangGraph to orchestrate
-one Team's internal Assistants and suspends before every requested Power; the Team Controller
-remains responsible for authorization, approval, execution and audit.
+This repository contains the isolated, provider-neutral reasoning runtime for Shimpz Teams. It uses
+LangGraph to select installed Assistant Powers and suspends before every external action. The Team
+controller remains authoritative for Assistant inventory, credentials, approvals, Power execution,
+result validation, cancellation, and audit; the runtime never executes a Power itself.
 
-`docker build .` produces a small Python 3.14 image running `runtime_api:app` as a non-root user. The
-runtime exposes:
+The authenticated API is intentionally small:
 
-- `GET /health` without authentication for container health checks.
-- `POST /v1/turns` to start or continue a conversation.
-- `POST /v1/turns/resume` to supply Controller-brokered Power results.
+- `GET /health` reports process/runtime health without exposing state or credentials;
+- `POST /v1/turns` starts one turn from controller-supplied Team/Assistant context;
+- `POST /v1/turns/resume` resumes a suspended turn with controller-brokered Power results; and
+- `POST /v1/threads/delete` deletes one exact conversation checkpoint during Team teardown.
 
-Both POST endpoints require the private bearer token mounted at
-`/run/shimpz-brain-runtime/token`. Conversation checkpoints are stored at
-`/var/lib/shimpz-brain-runtime/checkpoints.sqlite3`. The image starts one Uvicorn worker without
-access logging and disables LangSmith tracing by default.
+All POST endpoints require the private bearer mounted read-only at
+`/run/shimpz-brain-runtime/token`. Conversation checkpoints live at
+`/var/lib/shimpz-brain-runtime/checkpoints.sqlite3`. Provider API keys are operation-scoped request
+inputs: they are excluded from checkpoint state, responses, and logs.
 
----
-Part of the **[Shimpz](https://github.com/TheShimpz/shimpz)** stack.
+The image uses CPython 3.14, one non-root Uvicorn worker, a read-only root filesystem, dropped
+capabilities, and no direct Docker socket or internet network. Provider traffic can leave only through
+the audited egress proxy attached to the runtime's dedicated egress pair. LangSmith tracing and access
+logging are disabled by default.
+
+`agent_runtime.py` owns the model/tool state machine, `runtime_api.py` owns the HTTP/auth boundary, and
+their contracts live in `tests/`.
