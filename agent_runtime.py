@@ -29,8 +29,7 @@ from pydantic import SecretStr
 
 _MODEL_CATALOG = json.loads(Path(__file__).with_name("model_catalog.json").read_text(encoding="utf-8"))
 MODELS_BY_PROVIDER = {
-    provider["id"]: frozenset(model["id"] for model in provider["models"])
-    for provider in _MODEL_CATALOG["providers"]
+    provider["id"]: frozenset(model["id"] for model in provider["models"]) for provider in _MODEL_CATALOG["providers"]
 }
 PROVIDERS = frozenset(MODELS_BY_PROVIDER)
 APPROVALS = frozenset({"none", "once", "each-run"})
