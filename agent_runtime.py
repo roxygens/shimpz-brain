@@ -319,6 +319,37 @@ def _message_content(value: object) -> str:
     return "\n".join(text)
 
 
+def _pending_result(pending: object) -> TurnResult:
+    requests: list[PowerRequest] = []
+    if not isinstance(pending, Sequence):
+        raise RuntimeContractError("invalid suspended graph state")
+    for item in pending:
+        value = getattr(item, "value", None)
+        interrupt_id = getattr(item, "id", None)
+        if (
+            not isinstance(value, Mapping)
+            or value.get("kind") != "power"
+            or not isinstance(interrupt_id, str)
+            or not interrupt_id
+            or POWER_ID_RE.fullmatch(str(value.get("assistant_id", ""))) is None
+            or POWER_ID_RE.fullmatch(str(value.get("power", ""))) is None
+            or not isinstance(value.get("input"), Mapping)
+            or set(value) != {"kind", "assistant_id", "power", "input"}
+        ):
+            raise RuntimeContractError("invalid Power suspension")
+        requests.append(
+            PowerRequest(
+                interrupt_id=interrupt_id,
+                assistant_id=str(value["assistant_id"]),
+                power=str(value["power"]),
+                input=dict(value["input"]),
+            )
+        )
+    if not requests:
+        raise RuntimeContractError("empty graph suspension")
+    return TurnResult(status="power-required", powers=tuple(requests))
+
+
 def _result(
     state: Mapping[str, Any],
     *,
@@ -327,34 +358,7 @@ def _result(
 ) -> TurnResult:
     pending = state.get("__interrupt__")
     if pending:
-        requests: list[PowerRequest] = []
-        if not isinstance(pending, Sequence):
-            raise RuntimeContractError("invalid suspended graph state")
-        for item in pending:
-            value = getattr(item, "value", None)
-            interrupt_id = getattr(item, "id", None)
-            if (
-                not isinstance(value, Mapping)
-                or value.get("kind") != "power"
-                or not isinstance(interrupt_id, str)
-                or not interrupt_id
-                or POWER_ID_RE.fullmatch(str(value.get("assistant_id", ""))) is None
-                or POWER_ID_RE.fullmatch(str(value.get("power", ""))) is None
-                or not isinstance(value.get("input"), Mapping)
-                or set(value) != {"kind", "assistant_id", "power", "input"}
-            ):
-                raise RuntimeContractError("invalid Power suspension")
-            requests.append(
-                PowerRequest(
-                    interrupt_id=interrupt_id,
-                    assistant_id=str(value["assistant_id"]),
-                    power=str(value["power"]),
-                    input=dict(value["input"]),
-                )
-            )
-        if not requests:
-            raise RuntimeContractError("empty graph suspension")
-        return TurnResult(status="power-required", powers=tuple(requests))
+        return _pending_result(pending)
 
     messages = state.get("messages")
     if not isinstance(messages, Sequence):
@@ -386,6 +390,25 @@ def _result(
         if reply:
             return TurnResult(status="completed", reply=reply[:MAX_REPLY_CHARS])
     raise RuntimeContractError("graph completed without an Assistant reply")
+
+
+def _has_pending_interrupt(pending_writes: object) -> bool:
+    if pending_writes is not None and (
+        not isinstance(pending_writes, Sequence) or isinstance(pending_writes, (str, bytes))
+    ):
+        raise RuntimeStateError("checkpoint pending state is invalid")
+    has_pending_interrupt = False
+    for write in pending_writes or ():
+        if (
+            not isinstance(write, tuple)
+            or len(write) != 3
+            or not isinstance(write[0], str)
+            or not isinstance(write[1], str)
+        ):
+            raise RuntimeStateError("checkpoint pending state is invalid")
+        if write[1] == "__interrupt__":
+            has_pending_interrupt = True
+    return has_pending_interrupt
 
 
 class AgentRuntime:
@@ -447,22 +470,7 @@ class AgentRuntime:
             if resume:
                 raise RuntimeContractError("conversation has no pending Power request")
             return 0
-        pending_writes = getattr(checkpoint_tuple, "pending_writes", None)
-        if pending_writes is not None and (
-            not isinstance(pending_writes, Sequence) or isinstance(pending_writes, (str, bytes))
-        ):
-            raise RuntimeStateError("checkpoint pending state is invalid")
-        has_pending_interrupt = False
-        for write in pending_writes or ():
-            if (
-                not isinstance(write, tuple)
-                or len(write) != 3
-                or not isinstance(write[0], str)
-                or not isinstance(write[1], str)
-            ):
-                raise RuntimeStateError("checkpoint pending state is invalid")
-            if write[1] == "__interrupt__":
-                has_pending_interrupt = True
+        has_pending_interrupt = _has_pending_interrupt(getattr(checkpoint_tuple, "pending_writes", None))
         if resume and not has_pending_interrupt:
             raise RuntimeContractError("conversation has no pending Power request")
         if not resume and has_pending_interrupt:
