@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import httpx
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
@@ -183,7 +184,7 @@ class Checkpointer(Protocol):
 ModelFactory = Callable[[ProviderConfig], BaseChatModel]
 
 
-def provider_model(config: ProviderConfig) -> BaseChatModel:
+def provider_model(config: ProviderConfig, *, http_client: httpx.Client | None = None) -> BaseChatModel:
     """Create one direct provider client; the API key is never put in graph state."""
     secret = SecretStr(config.api_key)
     common = {
@@ -193,10 +194,26 @@ def provider_model(config: ProviderConfig) -> BaseChatModel:
         "max_retries": 2,
     }
     if config.provider == "openai":
-        return ChatOpenAI(**common, use_responses_api=True)
+        openai = {**common, "use_responses_api": True}
+        if http_client is not None:
+            openai["http_client"] = http_client
+        return ChatOpenAI(**openai)
     if config.provider == "anthropic":
         return ChatAnthropic(**common)
     raise RuntimeContractError("unsupported model provider")
+
+
+class ProviderModelFactory:
+    """Build short-lived credential holders over one credential-free connection pool."""
+
+    def __init__(self) -> None:
+        self._http_client = httpx.Client()
+
+    def __call__(self, config: ProviderConfig) -> BaseChatModel:
+        return provider_model(config, http_client=self._http_client)
+
+    def close(self) -> None:
+        self._http_client.close()
 
 
 def _tool_name(assistant_id: str, power_id: str) -> str:
@@ -412,11 +429,12 @@ def _has_pending_interrupt(pending_writes: object) -> bool:
 
 
 class AgentRuntime:
-    """Compile short-lived provider clients over one durable, provider-neutral graph state."""
+    """Compile short-lived provider models over one durable, provider-neutral graph state."""
 
-    def __init__(self, checkpointer: Checkpointer, *, model_factory: ModelFactory = provider_model) -> None:
+    def __init__(self, checkpointer: Checkpointer, *, model_factory: ModelFactory | None = None) -> None:
         self._checkpointer = checkpointer
-        self._model_factory = model_factory
+        self._model_factory = model_factory or ProviderModelFactory()
+        self._owns_model_factory = model_factory is None
         self._thread_locks = tuple(threading.RLock() for _ in range(THREAD_LOCK_STRIPES))
 
     def _thread_lock(self, thread_id: str) -> threading.RLock:
@@ -424,7 +442,11 @@ class AgentRuntime:
         return self._thread_locks[int.from_bytes(digest[:2]) % len(self._thread_locks)]
 
     def close(self) -> None:
-        """Close a durable checkpointer connection when this runtime owns one."""
+        """Close runtime-owned provider and checkpointer connections."""
+        if self._owns_model_factory:
+            close_factory = getattr(self._model_factory, "close", None)
+            if callable(close_factory):
+                close_factory()
         connection = getattr(self._checkpointer, "conn", None)
         close = getattr(connection, "close", None)
         if callable(close):

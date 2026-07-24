@@ -614,6 +614,35 @@ class AgentRuntimeTests(unittest.TestCase):
             ):
                 agent_runtime.ProviderConfig(provider=provider, model=model, api_key="secret-test-key")
 
+    def test_openai_models_reuse_a_credential_free_http_transport(self):
+        transport = mock.Mock()
+        with (
+            mock.patch.object(agent_runtime.httpx, "Client", return_value=transport),
+            mock.patch.object(agent_runtime, "ChatOpenAI", side_effect=[mock.Mock(), mock.Mock()]) as constructor,
+        ):
+            factory = agent_runtime.ProviderModelFactory()
+            factory(
+                agent_runtime.ProviderConfig(
+                    provider="openai",
+                    model="gpt-5.6-terra",
+                    api_key="first-secret-key",
+                )
+            )
+            factory(
+                agent_runtime.ProviderConfig(
+                    provider="openai",
+                    model="gpt-5.6-terra",
+                    api_key="second-secret-key",
+                )
+            )
+            factory.close()
+
+        first, second = constructor.call_args_list
+        self.assertIs(first.kwargs["http_client"], transport)
+        self.assertIs(second.kwargs["http_client"], transport)
+        self.assertNotEqual(first.kwargs["api_key"], second.kwargs["api_key"])
+        transport.close.assert_called_once_with()
+
     def test_openai_uses_responses_api_without_changing_anthropic(self):
         with (
             mock.patch.object(agent_runtime, "ChatOpenAI") as openai,
