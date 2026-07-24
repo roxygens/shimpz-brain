@@ -17,6 +17,12 @@ All POST endpoints require the private bearer mounted read-only at
 `/var/lib/shimpz-brain-runtime/checkpoints.sqlite3`. Provider API keys are operation-scoped request
 inputs: they are excluded from checkpoint state, responses, and logs.
 
+Before each start or resume, the runtime prunes that thread to its newest self-contained checkpoint
+and pending writes in each LangGraph namespace. The controller owns the only resumable
+human-interaction state and expires its authority to resume within 900 seconds. The newest suspended
+checkpoint is retained, but cannot be resumed after that controller window. Team teardown calls the exact
+thread-delete endpoint. Historical checkpoint replay and time travel are not part of the runtime contract.
+
 The image uses CPython 3.14, one non-root Uvicorn worker, a read-only root filesystem, dropped
 capabilities, and no direct Docker socket or internet network. Provider traffic can leave only through
 the audited egress proxy attached to the runtime's dedicated egress pair. LangSmith tracing and access

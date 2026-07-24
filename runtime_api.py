@@ -20,6 +20,20 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 TOKEN_FILE = Path(os.environ.get("SHIMPZ_BRAIN_RUNTIME_TOKEN_FILE", "/run/shimpz-brain-runtime/token"))
 STATE_PATH = Path(os.environ.get("SHIMPZ_BRAIN_RUNTIME_STATE", "/var/lib/shimpz-brain-runtime/checkpoints.sqlite3"))
 MAX_TOKEN_BYTES = 4 * 1024
+_PRUNE_WRITES_SQL = (
+    "WITH latest AS (SELECT checkpoint_ns,MAX(checkpoint_id) AS checkpoint_id "
+    "FROM checkpoints WHERE thread_id=? GROUP BY checkpoint_ns) "
+    "DELETE FROM writes WHERE thread_id=? AND NOT EXISTS ("
+    "SELECT 1 FROM latest WHERE latest.checkpoint_ns=writes.checkpoint_ns "
+    "AND latest.checkpoint_id=writes.checkpoint_id)"
+)
+_PRUNE_CHECKPOINTS_SQL = (
+    "WITH latest AS (SELECT checkpoint_ns,MAX(checkpoint_id) AS checkpoint_id "
+    "FROM checkpoints WHERE thread_id=? GROUP BY checkpoint_ns) "
+    "DELETE FROM checkpoints WHERE thread_id=? AND NOT EXISTS ("
+    "SELECT 1 FROM latest WHERE latest.checkpoint_ns=checkpoints.checkpoint_ns "
+    "AND latest.checkpoint_id=checkpoints.checkpoint_id)"
+)
 
 
 class ProviderInput(BaseModel):
@@ -132,6 +146,15 @@ class RuntimeLike:
 TokenReader = Callable[[], str]
 
 
+class PruningSqliteSaver(SqliteSaver):
+    """Retain only the latest self-contained checkpoint in each thread namespace."""
+
+    def prune_thread(self, thread_id: str) -> None:
+        with self.lock, self.conn:
+            self.conn.execute(_PRUNE_WRITES_SQL, (thread_id, thread_id))
+            self.conn.execute(_PRUNE_CHECKPOINTS_SQL, (thread_id, thread_id))
+
+
 def _token_from_file() -> str:
     try:
         raw = TOKEN_FILE.read_bytes()
@@ -155,7 +178,7 @@ def _sqlite_runtime(path: Path = STATE_PATH) -> agent_runtime.AgentRuntime:
     if path.exists():
         path.chmod(0o600)
     connection.execute("PRAGMA secure_delete=ON")
-    checkpointer = SqliteSaver(connection)
+    checkpointer = PruningSqliteSaver(connection)
     checkpointer.setup()
     return agent_runtime.AgentRuntime(checkpointer)
 

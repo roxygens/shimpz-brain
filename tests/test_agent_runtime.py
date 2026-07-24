@@ -108,6 +108,23 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(result.reply, "Hello, Captain.")
         self.assertEqual(result.powers, ())
 
+    def test_prunes_checkpoint_history_before_each_provider_turn(self):
+        class PruningSaver(InMemorySaver):
+            def __init__(self):
+                super().__init__()
+                self.pruned: list[str] = []
+
+            def prune_thread(self, thread_id: str) -> None:
+                self.pruned.append(thread_id)
+
+        saver = PruningSaver()
+        model = ToolAwareFakeModel(responses=[AIMessage(content="Hello, Captain.")])
+        runtime = agent_runtime.AgentRuntime(saver, model_factory=lambda _config: model)
+
+        runtime.start(context(), "Say hello")
+
+        self.assertEqual(saver.pruned, ["cap:hello:thread-1"])
+
     def test_empty_assistant_context_binds_no_tools_and_returns_a_natural_reply(self):
         model = ToolAwareFakeModel(responses=[AIMessage(content="I can help you think this through.")])
         runtime = agent_runtime.AgentRuntime(InMemorySaver(), model_factory=lambda _config: model)

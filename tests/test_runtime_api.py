@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -299,6 +300,40 @@ class RuntimeApiTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
             runtime.close()
+
+    def test_sqlite_checkpoint_pruning_keeps_only_each_namespace_latest_state(self):
+        connection = sqlite3.connect(":memory:", check_same_thread=False)
+        saver = runtime_api.PruningSqliteSaver(connection)
+        saver.setup()
+        checkpoints = [
+            ("thread-a", "", "001"),
+            ("thread-a", "", "002"),
+            ("thread-a", "subgraph", "003"),
+            ("thread-a", "subgraph", "004"),
+            ("thread-b", "", "005"),
+        ]
+        connection.executemany(
+            "INSERT INTO checkpoints(thread_id,checkpoint_ns,checkpoint_id,type,checkpoint,metadata) "
+            "VALUES(?,?,?,'json',X'00',X'00')",
+            checkpoints,
+        )
+        connection.executemany(
+            "INSERT INTO writes(thread_id,checkpoint_ns,checkpoint_id,task_id,idx,channel,type,value) "
+            "VALUES(?,?,?,'task',0,'channel','json',X'00')",
+            checkpoints,
+        )
+
+        saver.prune_thread("thread-a")
+
+        self.assertEqual(
+            connection.execute(
+                "SELECT thread_id,checkpoint_ns,checkpoint_id FROM checkpoints "
+                "ORDER BY thread_id,checkpoint_ns,checkpoint_id"
+            ).fetchall(),
+            [("thread-a", "", "002"), ("thread-a", "subgraph", "004"), ("thread-b", "", "005")],
+        )
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM writes").fetchone(), (3,))
+        connection.close()
 
 
 if __name__ == "__main__":

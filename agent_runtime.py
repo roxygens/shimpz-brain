@@ -441,6 +441,15 @@ class AgentRuntime:
         digest = hashlib.sha256(thread_id.encode()).digest()
         return self._thread_locks[int.from_bytes(digest[:2]) % len(self._thread_locks)]
 
+    def _prune_history(self, thread_id: str) -> None:
+        prune = getattr(self._checkpointer, "prune_thread", None)
+        if not callable(prune):
+            return
+        try:
+            prune(thread_id)
+        except Exception as exc:
+            raise RuntimeStateError("checkpoint pruning failed") from exc
+
     def close(self) -> None:
         """Close runtime-owned provider and checkpointer connections."""
         if self._owns_model_factory:
@@ -523,6 +532,7 @@ class AgentRuntime:
         try:
             with self._thread_lock(context.thread_id):
                 self._prepare_scope(context, resume=False)
+                self._prune_history(context.thread_id)
                 state = self._agent(context).invoke(
                     {"messages": [HumanMessage(content=message, id=turn_id)]},
                     config=self._config(context),
@@ -539,6 +549,7 @@ class AgentRuntime:
         try:
             with self._thread_lock(context.thread_id):
                 message_offset = self._prepare_scope(context, resume=True)
+                self._prune_history(context.thread_id)
                 state = self._agent(context).invoke(
                     Command(resume=dict(results)),
                     config=self._config(context),
